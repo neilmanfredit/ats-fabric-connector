@@ -1,0 +1,103 @@
+name: afc-ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "feature/**"
+
+permissions:
+  contents: read
+
+env:
+  INGESTR_DISABLE_TELEMETRY: "true"
+  DISABLE_TELEMETRY: "true"
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: Check repository structure
+        run: fabric/scripts/check-structure.sh
+
+      - name: Check for sensitive/local-only files
+        run: fabric/scripts/check-sensitive-files.sh tracked
+
+      - name: Check attribution (commit range)
+        run: fabric/scripts/check-attribution.sh range "origin/${{ github.event.pull_request.base.ref || 'main' }}..HEAD"
+
+      - name: Check attribution (pull request title and body)
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          fabric/scripts/check-attribution.sh env PR_TITLE
+          fabric/scripts/check-attribution.sh env PR_BODY
+
+      - name: make format (fails on diff)
+        run: |
+          make format
+          git diff --exit-code
+
+      - name: make lint
+        run: make lint
+
+      - name: make test
+        run: make test
+
+      - name: make licenses-audit
+        run: make licenses-audit
+
+      - name: make build
+        run: make build
+
+      - name: Confirm bullhorn scheme is registered
+        run: |
+          set +e
+          OUTPUT=$(./bin/ingestr ingest --source-uri="bullhorn://" --dest-uri="duckdb:///tmp/afc-ci-scheme-check.duckdb" --source-table=candidate --yes 2>&1)
+          set -e
+          if echo "$OUTPUT" | grep -qiE "unsupported (uri )?scheme|no (source|registered) (found|for)"; then
+            echo "bullhorn scheme does not appear to be registered:" >&2
+            echo "$OUTPUT" >&2
+            exit 1
+          fi
+          echo "bullhorn scheme is registered (command failed for an unrelated, expected reason: missing configuration)"
+
+      - name: Runner tests
+        run: go test ./fabric/runner/...
+
+      - name: Reconciliation tests
+        run: go test ./fabric/reconcile/...
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+
+      - name: Container build (no push)
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          file: fabric/deploy/Dockerfile
+          push: false
+          build-args: |
+            INGESTR_DISABLE_TELEMETRY=true
+            DISABLE_TELEMETRY=true

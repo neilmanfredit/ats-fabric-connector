@@ -204,3 +204,39 @@ benchmarks/results/*.json
 benchmarks/results/*.md
 benchmarks/results/*_summary*
 !benchmarks/results/.gitkeep
+
+# --- ats-fabric-connector: sensitive and local-only files (never track, commit, push or snapshot) ---
+# Build briefs
+briefs/
+*BUILD_BRIEF*
+*.brief.md
+
+# Environment and secret material
+.env
+.env.*
+*.token
+*.pem
+*.key
+*.pfx
+secrets/
+token_output*
+
+# Runtime state and outputs
+fabric/state/
+fabric/verification/results/
+*.duckdb
+*.duckdb.wal
+*.parquet
+!pkg/**/testdata/**/*.parquet
+
+# Local tool configuration
+CLAUDE.local.md
+.claude/settings.local.json
+
+# Excluded upstream developer-agent files (kept in the read-only reference
+# clone only; never carried into this repository's snapshots)
+CLAUDE.md
+AGENTS.md
+.claude/
+skills/
+.agents/

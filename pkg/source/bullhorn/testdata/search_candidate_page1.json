@@ -1,0 +1,20 @@
+{
+  "data": [
+    {
+      "_score": 1.70002,
+      "id": 5059165,
+      "firstName": "Alanzo",
+      "lastName": "Smith",
+      "dateLastModified": 1495559294820,
+      "isDeleted": false
+    },
+    {
+      "_score": 1.65,
+      "id": 5059166,
+      "firstName": "Beatriz",
+      "lastName": "Nowak",
+      "dateLastModified": 1495559300000,
+      "isDeleted": false
+    }
+  ]
+}

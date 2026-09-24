@@ -1,0 +1,24 @@
+ats-fabric-connector
+
+This project is a fork of ingestr (https://github.com/bruin-data/ingestr),
+forked from upstream commit d4f3a143dbbc021268309728ca88ae16316f1fda.
+
+ingestr is copyright Bruin Data Limited and is licensed under the Functional
+Source License, Version 1.1, ALv2 Future License (FSL-1.1-ALv2). See LICENSE.
+
+Modifications in this repository, including but not limited to the Bullhorn
+ATS/CRM source (pkg/source/bullhorn/) and the fabric/ toolkit (seed load,
+scheduled runner, reconciliation, deployment templates and scripts), are
+copyright 2026 Neil Manfred and are licensed under the same FSL-1.1-ALv2
+terms as the rest of this repository. See LICENSE and THIRD_PARTY_LICENSES.txt,
+which are kept unchanged from upstream.
+
+The upstream ingestr README.md, which documents ingestr's own supported
+sources and destinations, was originally at the root of this repository. It
+has been replaced at that location by this project's own README.md; the
+upstream README's content is preserved in the ingestr project itself at
+https://github.com/bruin-data/ingestr/blob/main/README.md and is not
+reproduced here.
+
+This project is not affiliated with, endorsed by, or supported by Bruin Data
+Limited or Bullhorn, Inc. Bullhorn is a trademark of Bullhorn, Inc.

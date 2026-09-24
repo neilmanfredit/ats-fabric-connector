@@ -1,0 +1,22 @@
+{
+  "requestId": 42,
+  "events": [
+    {
+      "eventId": "ID:JBM-40000517",
+      "eventType": "ENTITY",
+      "eventTimestamp": 1495559294820,
+      "entityName": "ClientContact",
+      "entityId": 8592,
+      "entityEventType": "UPDATED",
+      "updatedProperties": ["username", "password"]
+    },
+    {
+      "eventId": "ID:JBM-40000518",
+      "eventType": "ENTITY",
+      "eventTimestamp": 1495559300000,
+      "entityName": "Candidate",
+      "entityId": 5059165,
+      "entityEventType": "DELETED"
+    }
+  ]
+}
