@@ -31,6 +31,9 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install formatting and lint tools
+        run: make setup
+
       - name: Check repository structure
         run: fabric/scripts/check-structure.sh
 
