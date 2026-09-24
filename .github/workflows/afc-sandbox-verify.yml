@@ -1,0 +1,51 @@
+name: afc-sandbox-verify
+
+# Manual, maintainer-triggered verification against a live Bullhorn sandbox
+# tenant. Gated by the `sandbox` GitHub environment's required reviewers —
+# this must never run automatically or on a pull request from a fork.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  INGESTR_DISABLE_TELEMETRY: "true"
+  DISABLE_TELEMETRY: "true"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    environment: sandbox
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build runner and reconciliation binaries
+        run: |
+          go build -o bin/afc-runner ./fabric/runner
+          go build -o bin/afc-reconcile ./fabric/reconcile
+
+      - name: Run against sandbox tenant
+        env:
+          BULLHORN_CLIENT_ID: ${{ secrets.BULLHORN_CLIENT_ID }}
+          BULLHORN_CLIENT_SECRET: ${{ secrets.BULLHORN_CLIENT_SECRET }}
+          BULLHORN_REFRESH_TOKEN: ${{ secrets.BULLHORN_REFRESH_TOKEN }}
+          BULLHORN_USERNAME: ${{ secrets.BULLHORN_USERNAME }}
+          BULLHORN_DATA_CENTER: ${{ secrets.BULLHORN_DATA_CENTER }}
+          FABRIC_WORKSPACE: ${{ secrets.FABRIC_WORKSPACE }}
+          FABRIC_LAKEHOUSE: ${{ secrets.FABRIC_LAKEHOUSE }}
+        run: |
+          ./bin/afc-runner --entities fabric/runner/entities.example.yaml
+          ./bin/afc-reconcile --entities fabric/runner/entities.example.yaml
+
+      - name: Publish aggregate results only
+        run: |
+          echo "Sandbox verification complete. Only aggregate counts, column names/types, durations, call volumes and error codes may be published as job output or artefacts — never record content." >> "$GITHUB_STEP_SUMMARY"
