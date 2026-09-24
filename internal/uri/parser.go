@@ -1,0 +1,144 @@
+package uri
+
+import (
+	"errors"
+	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+)
+
+type ParsedURI struct {
+	Scheme   string
+	Username string
+	Password string
+	Host     string
+	Port     int
+	Database string
+	Params   map[string]string
+	RawURI   string
+}
+
+// fileBasedSchemes are schemes that use file paths instead of network URIs
+var fileBasedSchemes = map[string]bool{
+	"jsonl": true, "ndjson": true, "json": true,
+	"csv": true, "parquet": true, "avro": true,
+	"sqlite": true, "duckdb": true, "motherduck": true, "md": true, "mmap": true,
+}
+
+// authorityOpaqueSchemes carry a value in the authority position that url.Parse
+// cannot represent — a OneLake workspace name may contain a space. Their
+// connectors parse the raw URI themselves.
+var authorityOpaqueSchemes = map[string]bool{"onelake": true}
+
+func Parse(rawURI string) (*ParsedURI, error) {
+	scheme, err := ExtractScheme(rawURI)
+	if err != nil {
+		return nil, err
+	}
+
+	normalizedScheme := NormalizeScheme(scheme)
+
+	// Skip url.Parse where it cannot represent the URI: file-based schemes carry
+	// Windows paths, and authority-opaque schemes carry names with characters that
+	// are invalid in a host.
+	if fileBasedSchemes[normalizedScheme] || authorityOpaqueSchemes[normalizedScheme] {
+		return &ParsedURI{
+			Scheme: normalizedScheme,
+			RawURI: rawURI,
+			Params: make(map[string]string),
+		}, nil
+	}
+
+	// The scheme was already extracted above, so parse the rest under a
+	// placeholder: url.Parse rejects scheme characters ingestr allows, such as
+	// the underscore in ps_mysql.
+	normalizedURI := rawURI
+	if parts := strings.SplitN(rawURI, "://", 2); len(parts) == 2 {
+		normalizedURI = "scheme://" + parts[1]
+	}
+
+	parsed, err := url.Parse(normalizedURI)
+	if err != nil {
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = urlErr.Err
+		}
+		return nil, fmt.Errorf("failed to parse URI: %w", err)
+	}
+
+	result := &ParsedURI{
+		Scheme: NormalizeScheme(scheme),
+		RawURI: rawURI,
+		Params: make(map[string]string),
+	}
+
+	if parsed.User != nil {
+		result.Username = parsed.User.Username()
+		result.Password, _ = parsed.User.Password()
+	}
+
+	result.Host = parsed.Hostname()
+	if portStr := parsed.Port(); portStr != "" {
+		result.Port, _ = strconv.Atoi(portStr)
+	}
+
+	result.Database = strings.TrimPrefix(parsed.Path, "/")
+
+	for key, values := range parsed.Query() {
+		if len(values) > 0 {
+			result.Params[key] = values[0]
+		}
+	}
+
+	return result, nil
+}
+
+func ExtractScheme(uri string) (string, error) {
+	idx := strings.Index(uri, "://")
+	if idx == -1 {
+		return "", fmt.Errorf("invalid URI: no scheme found")
+	}
+	return strings.ToLower(uri[:idx]), nil
+}
+
+func NormalizeScheme(scheme string) string {
+	aliases := map[string]string{
+		"postgresql":          "postgres",
+		"postgresql+psycopg2": "postgres",
+		"postgresql+asyncpg":  "postgres",
+		"pg":                  "postgres",
+		"redshift+psycopg2":   "redshift",
+		"azure-sql":           "azuresql",
+	}
+	if canonical, ok := aliases[scheme]; ok {
+		return canonical
+	}
+	return scheme
+}
+
+func (p *ParsedURI) ToConnectionString() string {
+	var parts []string
+
+	if p.Host != "" {
+		parts = append(parts, fmt.Sprintf("host=%s", p.Host))
+	}
+	if p.Port > 0 {
+		parts = append(parts, fmt.Sprintf("port=%d", p.Port))
+	}
+	if p.Database != "" {
+		parts = append(parts, fmt.Sprintf("dbname=%s", p.Database))
+	}
+	if p.Username != "" {
+		parts = append(parts, fmt.Sprintf("user=%s", p.Username))
+	}
+	if p.Password != "" {
+		parts = append(parts, fmt.Sprintf("password=%s", p.Password))
+	}
+
+	for key, value := range p.Params {
+		parts = append(parts, fmt.Sprintf("%s=%s", key, value))
+	}
+
+	return strings.Join(parts, " ")
+}

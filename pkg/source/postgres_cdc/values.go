@@ -1,0 +1,405 @@
+package postgres_cdc
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/bruin-data/ingestr/pkg/schema"
+)
+
+type tupleUnchanged struct {
+	RelationMissing bool
+}
+
+var (
+	tupleUnchangedMarker       = tupleUnchanged{}
+	tupleRelationMissingMarker = tupleUnchanged{RelationMissing: true}
+)
+
+func isTupleUnchanged(v interface{}) bool {
+	_, ok := v.(tupleUnchanged)
+	return ok
+}
+
+func isRelationMissingMarker(v interface{}) bool {
+	marker, ok := v.(tupleUnchanged)
+	return ok && marker.RelationMissing
+}
+
+func resolveColumnValue(change Change, colIdx int) interface{} {
+	return resolveColumnValueBase(change, colIdx)
+}
+
+func resolveColumnValueBase(change Change, colIdx int) interface{} {
+	var val interface{}
+	if colIdx < len(change.Values) {
+		val = change.Values[colIdx]
+	}
+	if !isTupleUnchanged(val) {
+		return val
+	}
+	if change.Operation == "UPDATE" && colIdx < len(change.OldValues) {
+		old := change.OldValues[colIdx]
+		if old != nil && !isTupleUnchanged(old) {
+			return old
+		}
+	}
+	return nil
+}
+
+func fillUnchangedColumns(ctx context.Context, changes []Change, tableSchema *schema.TableSchema, table string, state *toastState) error {
+	if len(changes) == 0 || tableSchema == nil {
+		return nil
+	}
+	pkIndices := pkColumnIndices(tableSchema.Columns, tableSchema.PrimaryKeys)
+	if len(pkIndices) == 0 {
+		return nil
+	}
+	nSource := sourceColumnCount(tableSchema)
+	toastable := make([]bool, nSource)
+	hasToast := false
+	for i, col := range tableSchema.Columns[:nSource] {
+		switch col.DataType {
+		case schema.TypeString, schema.TypeBinary, schema.TypeJSON, schema.TypeArray, schema.TypeDecimal, schema.TypeUnknown:
+			toastable[i] = true
+			hasToast = true
+		}
+	}
+	if !hasToast {
+		return nil
+	}
+	for i := range changes {
+		change := &changes[i]
+		lookupKey, storeKey := fillStateKeys(*change, pkIndices, i)
+		prior, err := state.get(ctx, table, lookupKey)
+		if err != nil {
+			return err
+		}
+		for colIdx := 0; colIdx < nSource; colIdx++ {
+			if !columnIsUnchanged(*change, colIdx) {
+				continue
+			}
+			if base := resolveColumnValueBase(*change, colIdx); base != nil {
+				setColumnValue(change, colIdx, base)
+			} else if colIdx < len(prior) && !isTupleUnchanged(prior[colIdx]) {
+				setColumnValue(change, colIdx, prior[colIdx])
+			}
+		}
+		if pkValueChanged(*change, pkIndices) {
+			for colIdx := 0; colIdx < nSource; colIdx++ {
+				if columnIsUnchanged(*change, colIdx) {
+					if isRelationMissingMarker(change.Values[colIdx]) {
+						tableName := table
+						if tableName == "" {
+							tableName = tableSchema.Name
+							if tableSchema.Schema != "" {
+								tableName = tableSchema.Schema + "." + tableSchema.Name
+							}
+						}
+						return newSchemaChangedError(tableName, []SchemaMismatch{{
+							Column: tableSchema.Columns[colIdx].Name,
+							Reason: "is missing from the current replication relation",
+						}})
+					}
+					return fmt.Errorf("cannot replicate key change on %s.%s: unchanged TOAST column %q has no full row image; set REPLICA IDENTITY FULL before changing keys and use --full-refresh to rebuild from a fresh snapshot", quoteIdentifier(tableSchema.Schema), quoteIdentifier(tableSchema.Name), tableSchema.Columns[colIdx].Name)
+				}
+			}
+		}
+		if lookupKey != storeKey {
+			if err := state.delete(ctx, table, lookupKey); err != nil {
+				return err
+			}
+		}
+		if change.Operation == "DELETE" {
+			if err := state.delete(ctx, table, storeKey); err != nil {
+				return err
+			}
+			continue
+		}
+		next := make([]interface{}, nSource)
+		for colIdx := range next {
+			next[colIdx] = tupleUnchangedMarker
+			if colIdx < len(prior) {
+				next[colIdx] = prior[colIdx]
+			}
+			if toastable[colIdx] && columnIsAuthoritative(*change, colIdx) {
+				next[colIdx] = resolveColumnValue(*change, colIdx)
+			}
+		}
+		if err := state.put(ctx, table, storeKey, next, change.LSN); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// expandUpdates rewrites UPDATE changes whose row identity moved or is absent,
+// so the emitted stream stays applicable at the destination. It runs after
+// fillUnchangedColumns (which may still need the original UPDATE shape) and
+// before compaction.
+//
+// Keyed tables: an UPDATE that changes a key column would merge under the new
+// key and leave the old-key row behind in the destination forever. The old
+// tuple (sent by Postgres precisely because the identity changed) becomes a
+// DELETE for the old key, followed by the original UPDATE.
+//
+// Keyless tables (append-only change log, REPLICA IDENTITY FULL): an UPDATE's
+// new image alone cannot identify which row changed. It becomes a
+// DELETE(old image) + INSERT(new image) pair, making the log a self-contained
+// retract stream; unchanged-TOAST markers in the new image resolve from the
+// full old tuple.
+func expandUpdates(changes []Change, tableSchema *schema.TableSchema) []Change {
+	if len(changes) == 0 || tableSchema == nil {
+		return changes
+	}
+	pkIndices := pkColumnIndices(tableSchema.Columns, tableSchema.PrimaryKeys)
+	keyless := len(pkIndices) == 0
+
+	needsExpand := false
+	for i := range changes {
+		if updateNeedsExpansion(changes[i], pkIndices, keyless) {
+			needsExpand = true
+			break
+		}
+	}
+	if !needsExpand {
+		return changes
+	}
+
+	out := make([]Change, 0, len(changes)+1)
+	for _, c := range changes {
+		if !updateNeedsExpansion(c, pkIndices, keyless) {
+			out = append(out, c)
+			continue
+		}
+		deleteSequence := c.Sequence
+		if deleteSequence > 0 {
+			deleteSequence--
+		}
+		out = append(out, Change{Operation: "DELETE", LSN: c.LSN, Sequence: deleteSequence, Values: c.OldValues})
+		if keyless {
+			out = append(out, Change{Operation: "INSERT", LSN: c.LSN, Sequence: c.Sequence, Values: resolvedNewImage(c)})
+		} else {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func updateNeedsExpansion(c Change, pkIndices []int, keyless bool) bool {
+	if c.Operation != "UPDATE" || c.OldValues == nil {
+		return false
+	}
+	if keyless {
+		return true
+	}
+	return pkValueChanged(c, pkIndices)
+}
+
+// resolvedNewImage materializes an UPDATE's new tuple with unchanged-TOAST
+// markers resolved from the old tuple, so it can be emitted as a plain INSERT.
+func resolvedNewImage(c Change) []interface{} {
+	vals := make([]interface{}, len(c.Values))
+	for i := range c.Values {
+		vals[i] = resolveColumnValueBase(c, i)
+	}
+	return vals
+}
+
+// compactChanges keeps, per primary key, only the latest non-deleted and the
+// latest deleted change of the window, preserving original order. This is
+// exactly the set the destination merge reads — it upserts the latest active
+// row per PK and marks a delete only when the latest change overall is a
+// delete (DISTINCT ON ... ORDER BY lsn DESC, deleted DESC) — so dropping the
+// superseded rows cannot alter the merge outcome. Under update-heavy load
+// where many changes in a flush window hit the same rows, this shrinks the
+// staging volume to the surviving row versions.
+//
+// Must run after the unchanged-TOAST fill over the same window: the fill pulls
+// omitted column values out of the rows compaction is about to drop.
+func compactChanges(changes []Change, tableSchema *schema.TableSchema) []Change {
+	if len(changes) < 2 || tableSchema == nil {
+		return changes
+	}
+
+	pkIndices := pkColumnIndices(tableSchema.Columns, tableSchema.PrimaryKeys)
+	if len(pkIndices) == 0 {
+		return changes
+	}
+
+	type entry struct {
+		change Change
+		index  int
+	}
+
+	latestNonDeleted := make(map[string]entry)
+	latestDeleted := make(map[string]entry)
+
+	for i, change := range changes {
+		key := pkKeyFromRow(change.Values, change.OldValues, pkIndices, i)
+		if change.Operation == "DELETE" {
+			latestDeleted[key] = entry{change: change, index: i}
+		} else {
+			latestNonDeleted[key] = entry{change: change, index: i}
+		}
+	}
+
+	if len(latestNonDeleted)+len(latestDeleted) == len(changes) {
+		return changes
+	}
+
+	combined := make([]entry, 0, len(latestNonDeleted)+len(latestDeleted))
+	for _, e := range latestNonDeleted {
+		combined = append(combined, e)
+	}
+	for _, e := range latestDeleted {
+		combined = append(combined, e)
+	}
+
+	sort.Slice(combined, func(i, j int) bool {
+		return combined[i].index < combined[j].index
+	})
+
+	out := make([]Change, len(combined))
+	for i, e := range combined {
+		out[i] = e.change
+	}
+	return out
+}
+
+// setColumnValue overwrites a column's value in place, replacing an unchanged
+// marker once we have resolved the value it stood for.
+func setColumnValue(change *Change, colIdx int, val interface{}) {
+	if colIdx < len(change.Values) {
+		change.Values[colIdx] = val
+	}
+}
+
+// columnIsAuthoritative reports whether the change carries a definite value for
+// the column — a real value, an explicit NULL, or an old-tuple value — as
+// opposed to an omitted unchanged-TOAST marker we cannot resolve.
+func columnIsAuthoritative(change Change, colIdx int) bool {
+	if !columnIsUnchanged(change, colIdx) {
+		return true
+	}
+	return resolveColumnValueBase(change, colIdx) != nil
+}
+
+func fillStateKeys(change Change, pkIndices []int, changeIndex int) (lookupKey, storeKey string) {
+	storeKey = pkKeyFromRow(change.Values, change.OldValues, pkIndices, changeIndex)
+	lookupKey = storeKey
+	if change.Operation == "UPDATE" && pkValueChanged(change, pkIndices) {
+		lookupKey = pkKeyFromRow(change.OldValues, change.OldValues, pkIndices, changeIndex)
+	}
+	return lookupKey, storeKey
+}
+
+func pkValueChanged(change Change, pkIndices []int) bool {
+	if change.Operation != "UPDATE" || change.OldValues == nil {
+		return false
+	}
+	for _, idx := range pkIndices {
+		old := columnValueAt(change.OldValues, idx)
+		cur := columnValueAt(change.Values, idx)
+		if isTupleUnchanged(cur) {
+			continue
+		}
+		if fmt.Sprintf("%v", old) != fmt.Sprintf("%v", cur) {
+			return true
+		}
+	}
+	return false
+}
+
+func columnValueAt(values []interface{}, idx int) interface{} {
+	if idx < len(values) {
+		return values[idx]
+	}
+	return nil
+}
+
+func pkColumnIndices(columns []schema.Column, primaryKeys []string) []int {
+	if len(primaryKeys) == 0 {
+		return nil
+	}
+	indices := make([]int, 0, len(primaryKeys))
+	for _, pk := range primaryKeys {
+		idx := -1
+		for colIdx, col := range columns {
+			if col.Name == pk {
+				idx = colIdx
+				break
+			}
+		}
+		if idx < 0 {
+			return nil
+		}
+		indices = append(indices, idx)
+	}
+	return indices
+}
+
+func pkKeyFromRow(values, oldValues []interface{}, pkIndices []int, changeIndex int) string {
+	parts := make([]string, len(pkIndices))
+	for i, idx := range pkIndices {
+		val := columnValueAt(values, idx)
+		if val == nil || isTupleUnchanged(val) {
+			val = columnValueAt(oldValues, idx)
+		}
+		if val == nil || isTupleUnchanged(val) {
+			return fmt.Sprintf("row-%d", changeIndex)
+		}
+		parts[i] = fmt.Sprintf("%T:%v", val, val)
+	}
+	return encodeKeyParts(parts)
+}
+
+// encodeKeyParts joins parts into a collision-free key by prefixing each with
+// its byte length. A plain delimiter (e.g. "|") is not injective: a value that
+// contains the delimiter could make two distinct composite keys collide and
+// cause TOAST values to be coalesced across different rows.
+func encodeKeyParts(parts []string) string {
+	var b strings.Builder
+	for _, p := range parts {
+		b.WriteString(strconv.Itoa(len(p)))
+		b.WriteByte(':')
+		b.WriteString(p)
+	}
+	return b.String()
+}
+
+func columnIsUnchanged(change Change, colIdx int) bool {
+	if change.Operation != "UPDATE" {
+		return false
+	}
+	if colIdx >= len(change.Values) {
+		return false
+	}
+	return isTupleUnchanged(change.Values[colIdx])
+}
+
+func unchangedColumnsJSON(change Change, columns []schema.Column, nSourceCols int) string {
+	if change.Operation != "UPDATE" {
+		return "[]"
+	}
+	names := make([]string, 0)
+	for i := 0; i < nSourceCols && i < len(columns); i++ {
+		// fillUnchangedColumns overwrites the unchanged marker of any column it
+		// resolves (including to NULL), so columnIsUnchanged already excludes
+		// filled columns here; a column still marked unchanged is one we have no
+		// staging value for and the destination must fall back to its target.
+		if !columnIsUnchanged(change, i) {
+			continue
+		}
+		names = append(names, columns[i].Name)
+	}
+	b, err := json.Marshal(names)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}

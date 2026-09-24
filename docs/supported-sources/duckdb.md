@@ -1,0 +1,269 @@
+# DuckDB
+
+DuckDB is an in-memory database designed to be fast and reliable.
+
+ingestr supports DuckDB as both a source and a destination, and also supports reading from / writing to **DuckLake** lakehouse tables backed by DuckDB.
+
+## URI format
+The URI format for DuckDB is as follows:
+
+```plaintext
+duckdb:///<database-file>
+```
+
+URI parameters:
+- `database-file`: the path to the DuckDB database file
+
+The same URI structure can be used both for sources and destinations.
+
+---
+
+## DuckLake
+
+[DuckLake](https://ducklake.select/) is a lakehouse table format developed by the DuckDB team. Data is stored as Parquet files in object storage (S3 / GCS / Azure Blob / S3-compatible); table metadata (schemas, snapshots, file lists) lives in a regular SQL database (DuckDB, SQLite, or Postgres).
+
+ingestr can read from and write to DuckLake tables using the `ducklake://` URI scheme. The same URI shape works for both source and destination:
+
+```bash
+# Read from a DuckLake source
+ingestr ingest \
+  --source-uri="ducklake://?catalog_type=...&storage_type=..." \
+  --source-table="schema.table" \
+  --dest-uri="postgres://..." \
+  --dest-table="schema.table"
+
+# Write to a DuckLake destination
+ingestr ingest \
+  --source-uri="mysql://..." \
+  --source-table="schema.table" \
+  --dest-uri="ducklake://?catalog_type=...&storage_type=..." \
+  --dest-table="schema.table"
+```
+
+### URI format
+
+```plaintext
+ducklake://?
+  catalog_type=<duckdb|sqlite|postgres>
+  &catalog_path=<file-path>                       # duckdb / sqlite catalogs
+  &catalog_host=<host>                            # postgres catalog
+  &catalog_port=<port>                            # postgres, optional (default: 5432)
+  &catalog_database=<db>                          # postgres catalog
+  &catalog_username=<user>                        # postgres catalog
+  &catalog_password=<pass>                        # postgres catalog
+
+  &storage_type=<s3|gcs|azure>
+  &storage_path=<s3://bucket/prefix | gs://bucket/prefix | az://container/prefix>
+  &storage_region=<region>                        # optional
+  &storage_endpoint=<endpoint>                    # S3-compatible (MinIO, R2, B2, Tigris)
+  &storage_url_style=<path|vhost>                 # path required for most S3-compatible
+  &storage_use_ssl=<true|false>                   # optional, default true
+  &storage_access_key=<key>                       # s3 / gcs
+  &storage_secret_key=<secret>                    # s3 / gcs
+  &storage_session_token=<token>                  # optional, AWS STS
+  &storage_connection_string=<conn-string>        # azure (account-key auth)
+  &storage_account_name=<account>                 # azure (credential-chain auth)
+```
+
+All values must be URL-encoded if they contain `&`, `=`, `/`, `?` or other reserved characters.
+
+### Catalog options
+
+| Catalog | When to use |
+|---|---|
+| `duckdb` | Local development, single-user. Catalog is a `.duckdb` file. |
+| `sqlite` | Same shape as `duckdb` but the metadata file is universally readable. |
+| `postgres` | Multi-user / production. Catalog lives in a Postgres database. |
+
+> [!NOTE]
+> If you are using `duckdb` as your catalog type, you're limited to a single client. Switch to `sqlite` or `postgres` if multiple processes need to read/write the lake concurrently.
+
+#### DuckDB
+
+```plaintext
+catalog_type=duckdb
+catalog_path=/data/metadata.duckdb
+```
+
+#### SQLite
+
+```plaintext
+catalog_type=sqlite
+catalog_path=/data/metadata.sqlite
+```
+
+#### Postgres
+
+```plaintext
+catalog_type=postgres
+catalog_host=metastore.internal
+catalog_port=5432                     # optional, defaults to 5432
+catalog_database=ducklake_meta
+catalog_username=lake_user
+catalog_password=lake_password
+```
+
+### Storage options
+
+#### AWS S3
+
+```plaintext
+storage_type=s3
+storage_path=s3://my-ducklake-bucket/lake
+storage_region=us-east-1              # optional, DuckDB defaults to us-east-1
+storage_access_key=AKIA...
+storage_secret_key=...
+storage_session_token=...             # optional, for AWS STS temporary credentials
+```
+
+#### S3-compatible (MinIO, R2, B2, Tigris, on-prem)
+
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `storage_endpoint` | yes | (AWS S3) | Endpoint host:port — `minio.local:9000`, `<account>.r2.cloudflarestorage.com`, `fly.storage.tigris.dev`, etc. |
+| `storage_url_style` | yes | `vhost` | `path` is required for MinIO and most non-AWS S3-compatible backends. |
+| `storage_use_ssl` | no | `true` | Set to `false` for plain-HTTP local dev (MinIO without TLS). |
+
+#### GCS
+
+```plaintext
+storage_type=gcs
+storage_path=gs://my-bucket/lake
+storage_access_key=GOOG...
+storage_secret_key=...
+```
+
+GCS uses S3 interoperability (HMAC) credentials, not OAuth. Create HMAC keys in the [GCP Console → Storage → Settings → Interoperability](https://console.cloud.google.com/storage/settings;tab=interoperability).
+
+#### Azure Blob Storage
+
+Authenticate either with an account-key `storage_connection_string`, or with
+`storage_account_name` alone to use DuckDB's credential chain (managed identity,
+`az login`, or environment credentials). Set exactly one — if both are provided,
+`storage_connection_string` takes precedence and `storage_account_name` is ignored.
+
+```plaintext
+# Account-key auth
+storage_type=azure
+storage_path=az://my-container/lake
+storage_connection_string=DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=...;EndpointSuffix=core.windows.net
+```
+
+```plaintext
+# Managed identity / az login / environment credentials
+storage_type=azure
+storage_path=az://my-container/lake
+storage_account_name=myaccount
+```
+
+ingestr loads the `azure` extension and sets `azure_transport_option_type = 'curl'`
+so TLS to `*.blob.core.windows.net` uses the system CA bundle — required on
+Linux/containers, which must have `ca-certificates` installed.
+
+---
+
+### DuckLake table layout
+
+The ingest command applies `--partition-by` and `--cluster-by` to DuckLake destination tables.
+As with the other destinations, both options apply to single-table ingests; multi-table runs
+ignore them.
+
+`--partition-by` accepts one date or timestamp column, matching the BigQuery destination's
+interface. Date columns use identity partitioning; timestamp columns are partitioned by
+`year`/`month`/`day`, giving one partition per calendar date:
+
+```bash
+ingestr ingest \
+  --source-uri="postgres://..." \
+  --source-table="public.events" \
+  --dest-uri="ducklake://?..." \
+  --dest-table="analytics.events" \
+  --partition-by="created_at"
+```
+
+For DuckLake, `--cluster-by` defines the table's physical sort order. Columns are sorted
+in the configured order, ascending:
+
+```bash
+--cluster-by="tenant_id,created_at"
+```
+
+Both options need the `ducklake` extension shipped with DuckDB 1.5 or newer. On an older
+cached DuckDB ADBC driver, `--cluster-by` fails with `Unsupported ALTER TABLE type in
+DuckLake`, and a partition specification does not survive the table rename that completes a
+replace run.
+
+An explicit layout is applied before writing, and DuckLake applies a changed partition or
+sort specification to newly written data; a replace/full-refresh writes the complete
+replacement using the requested layout. Omitting an option leaves that part of an existing
+table's layout untouched for incremental strategies, which write into the live table. A
+replace run builds a new table each time, so a layout must be passed on every run to be kept.
+
+---
+
+### Examples
+
+#### MinIO + DuckDB catalog (local development)
+
+```bash
+ingestr ingest \
+  --source-uri="mysql://user:pass@host/db" \
+  --source-table="public.orders" \
+  --dest-uri="ducklake://?catalog_type=duckdb&catalog_path=/data/metadata.duckdb&storage_type=s3&storage_path=s3://ducklake/warehouse&storage_endpoint=minio.local:9000&storage_url_style=path&storage_use_ssl=false&storage_access_key=minioadmin&storage_secret_key=minioadmin" \
+  --dest-table="public.orders"
+```
+
+#### Postgres catalog + AWS S3 (production)
+
+```bash
+ingestr ingest \
+  --source-uri="postgres://app-db:5432/prod" \
+  --source-table="public.events" \
+  --dest-uri="ducklake://?catalog_type=postgres&catalog_host=metastore.prod&catalog_database=ducklake_meta&catalog_username=lake_user&catalog_password=${LAKE_PASSWORD}&storage_type=s3&storage_path=s3://my-bucket/lake&storage_access_key=${AWS_ACCESS_KEY_ID}&storage_secret_key=${AWS_SECRET_ACCESS_KEY}" \
+  --dest-table="public.events"
+```
+
+#### Postgres catalog + Azure Blob Storage
+
+```bash
+ingestr ingest \
+  --source-uri="postgres://app-db:5432/prod" \
+  --source-table="public.events" \
+  --dest-uri="ducklake://?catalog_type=postgres&catalog_host=metastore.prod&catalog_database=ducklake_meta&catalog_username=lake_user&catalog_password=${LAKE_PASSWORD}&storage_type=azure&storage_path=az://my-container/lake&storage_connection_string=${AZURE_STORAGE_CONNECTION_STRING}" \
+  --dest-table="public.events"
+```
+
+#### Reading from DuckLake to Postgres
+
+```bash
+ingestr ingest \
+  --source-uri="ducklake://?catalog_type=postgres&catalog_host=metastore.prod&catalog_database=ducklake_meta&catalog_username=lake_user&catalog_password=${LAKE_PASSWORD}&storage_type=s3&storage_path=s3://my-bucket/lake&storage_access_key=${AWS_ACCESS_KEY_ID}&storage_secret_key=${AWS_SECRET_ACCESS_KEY}" \
+  --source-table="analytics.daily_revenue" \
+  --dest-uri="postgres://reporting-db:5432/reports" \
+  --dest-table="public.daily_revenue"
+```
+
+### Required vs optional fields
+
+| Field | Required | Notes |
+|---|---|---|
+| `catalog_type` | yes | One of `duckdb`, `sqlite`, `postgres` |
+| `catalog_path` | yes (duckdb / sqlite) | — |
+| `catalog_host` | yes (postgres) | — |
+| `catalog_database` | yes (postgres) | — |
+| `catalog_username` | yes (postgres) | — |
+| `catalog_password` | yes (postgres) | — |
+| `catalog_port` | no | Defaults to `5432` |
+| `storage_type` | yes | One of `s3`, `gcs`, `azure` |
+| `storage_path` | yes | Bucket/container path the lake writes to (`s3://`, `gs://`, `az://`) |
+| `storage_access_key` | yes (s3 / gcs) | — |
+| `storage_secret_key` | yes (s3 / gcs) | — |
+| `storage_connection_string` | yes (azure, unless `storage_account_name`) | Account-key connection string. Takes precedence if both are set |
+| `storage_account_name` | yes (azure, unless `storage_connection_string`) | Uses DuckDB's credential chain (managed identity / `az login` / env). Ignored if `storage_connection_string` is set |
+| `storage_endpoint` | yes for S3-compatible | Omit for real AWS S3 |
+| `storage_url_style` | yes for S3-compatible | `path` for MinIO, R2, B2, etc. |
+| `storage_use_ssl` | no | Set `false` for plain-HTTP local dev |
+| `storage_region` | no | DuckDB defaults to `us-east-1`; use `auto` for Cloudflare R2 |
+| `storage_session_token` | no | AWS STS temporary credentials |
+
+Invalid or incomplete URIs are rejected at parse time with a clear error message — no subprocess is spawned without a complete configuration.

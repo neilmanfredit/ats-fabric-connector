@@ -1,0 +1,593 @@
+package fabric
+
+import (
+	"context"
+	"errors"
+	"net/url"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/bruin-data/ingestr/pkg/destination"
+	"github.com/bruin-data/ingestr/pkg/naming"
+	"github.com/bruin-data/ingestr/pkg/schema"
+	"github.com/bruin-data/ingestr/pkg/schemaevolution"
+	mssqldb "github.com/microsoft/go-mssqldb"
+)
+
+func TestBuildMergeSQLWithIncrementalPredicate(t *testing.T) {
+	sql := buildMergeSQLWithPredicate(
+		"dbo.events",
+		"stage.events",
+		[]string{"id"},
+		[]string{"[id]", "[event_date]"},
+		[]string{"event_date"},
+		"target.[event_date] >= DATEADD(day, -7, CAST(GETDATE() AS date))",
+	)
+
+	if !strings.Contains(sql, "ON target.[id] = source.[id] AND (target.[event_date] >= DATEADD(day, -7, CAST(GETDATE() AS date)))") {
+		t.Fatalf("merge SQL missing incremental predicate: %s", sql)
+	}
+}
+
+func TestURIToConnString(t *testing.T) {
+	tests := []struct {
+		name          string
+		uri           string
+		wantErr       bool
+		wantDatabase  string
+		wantHost      string
+		wantUser      string // expected decoded user-id ("" means no userinfo)
+		wantPassword  string
+		wantQuery     map[string]string
+		wantWriteMode string
+	}{
+		{
+			name:          "service principal with tenant defaults to copy",
+			uri:           "fabric://client-id:s3cr3t@abc.datawarehouse.fabric.microsoft.com/MyWarehouse?tenant_id=tenant-123",
+			wantDatabase:  "MyWarehouse",
+			wantHost:      "abc.datawarehouse.fabric.microsoft.com:1433",
+			wantUser:      "client-id@tenant-123",
+			wantPassword:  "s3cr3t",
+			wantWriteMode: writeModeCopy,
+			wantQuery: map[string]string{
+				"fedauth":  "ActiveDirectoryServicePrincipal",
+				"database": "MyWarehouse",
+				"encrypt":  "true",
+			},
+		},
+		{
+			name:          "no credentials defaults to ActiveDirectoryDefault and copy",
+			uri:           "fabric://abc.datawarehouse.fabric.microsoft.com/wh",
+			wantDatabase:  "wh",
+			wantHost:      "abc.datawarehouse.fabric.microsoft.com:1433",
+			wantUser:      "",
+			wantWriteMode: writeModeCopy,
+			wantQuery: map[string]string{
+				"fedauth":  "ActiveDirectoryDefault",
+				"database": "wh",
+				"encrypt":  "true",
+			},
+		},
+		{
+			name:          "explicit fedauth and port are preserved",
+			uri:           "fabric://client-id:token@host.example.com:1234/wh?fedauth=ActiveDirectoryServicePrincipalAccessToken&tenant_id=t1",
+			wantDatabase:  "wh",
+			wantHost:      "host.example.com:1234",
+			wantUser:      "client-id@t1",
+			wantPassword:  "token",
+			wantWriteMode: writeModeCopy,
+			wantQuery: map[string]string{
+				"fedauth":  "ActiveDirectoryServicePrincipalAccessToken",
+				"database": "wh",
+				"encrypt":  "true",
+			},
+		},
+		{
+			name:          "write_strategy copy is accepted",
+			uri:           "fabric://client-id:s3cr3t@abc.datawarehouse.fabric.microsoft.com/wh?tenant_id=t1&write_strategy=copy",
+			wantDatabase:  "wh",
+			wantHost:      "abc.datawarehouse.fabric.microsoft.com:1433",
+			wantUser:      "client-id@t1",
+			wantPassword:  "s3cr3t",
+			wantWriteMode: writeModeCopy,
+			wantQuery: map[string]string{
+				"fedauth":  "ActiveDirectoryServicePrincipal",
+				"database": "wh",
+				"encrypt":  "true",
+			},
+		},
+		{
+			name:          "write_strategy insert is accepted",
+			uri:           "fabric://client-id:s3cr3t@abc.datawarehouse.fabric.microsoft.com/wh?tenant_id=t1&write_strategy=INSERT",
+			wantDatabase:  "wh",
+			wantHost:      "abc.datawarehouse.fabric.microsoft.com:1433",
+			wantUser:      "client-id@t1",
+			wantPassword:  "s3cr3t",
+			wantWriteMode: writeModeInsert,
+			wantQuery: map[string]string{
+				"fedauth":  "ActiveDirectoryServicePrincipal",
+				"database": "wh",
+				"encrypt":  "true",
+			},
+		},
+		{
+			name:    "invalid write_strategy errors",
+			uri:     "fabric://client-id:s3cr3t@abc.datawarehouse.fabric.microsoft.com/wh?tenant_id=t1&write_strategy=bulk",
+			wantErr: true,
+		},
+		{
+			name:    "wrong scheme errors",
+			uri:     "mssql://user:pass@host/db",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			connStr, database, writeMode, err := uriToConnString(tt.uri)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil (connStr=%q)", connStr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if database != tt.wantDatabase {
+				t.Errorf("database = %q, want %q", database, tt.wantDatabase)
+			}
+
+			if writeMode != tt.wantWriteMode {
+				t.Errorf("writeMode = %q, want %q", writeMode, tt.wantWriteMode)
+			}
+
+			u, perr := url.Parse(connStr)
+			if perr != nil {
+				t.Fatalf("result DSN is not a valid URL: %v", perr)
+			}
+			if u.Scheme != "sqlserver" {
+				t.Errorf("scheme = %q, want sqlserver", u.Scheme)
+			}
+			if u.Host != tt.wantHost {
+				t.Errorf("host = %q, want %q", u.Host, tt.wantHost)
+			}
+
+			gotUser := ""
+			if u.User != nil {
+				gotUser = u.User.Username()
+			}
+			if gotUser != tt.wantUser {
+				t.Errorf("user = %q, want %q", gotUser, tt.wantUser)
+			}
+			if tt.wantPassword != "" {
+				gotPass, _ := u.User.Password()
+				if gotPass != tt.wantPassword {
+					t.Errorf("password = %q, want %q", gotPass, tt.wantPassword)
+				}
+			}
+
+			q := u.Query()
+			for k, want := range tt.wantQuery {
+				if got := q.Get(k); got != want {
+					t.Errorf("query[%q] = %q, want %q", k, got, want)
+				}
+			}
+			// tenant_id must never leak into the DSN query.
+			if q.Has("tenant_id") {
+				t.Errorf("tenant_id should not appear in DSN query, got %q", q.Get("tenant_id"))
+			}
+			// write_strategy is ingestr-specific and must not leak into the DSN.
+			if q.Has("write_strategy") {
+				t.Errorf("write_strategy should not appear in DSN query, got %q", q.Get("write_strategy"))
+			}
+		})
+	}
+}
+
+func TestBuildCreateTableSQLAddsPrimaryKeyWithAlterTable(t *testing.T) {
+	sql := buildCreateTableSQL("dbo.events", []schema.Column{
+		{Name: "id", DataType: schema.TypeInt64},
+		{Name: "payload", DataType: schema.TypeString},
+	}, []string{"id"})
+
+	createIdx := strings.Index(sql, "CREATE TABLE")
+	alterIdx := strings.Index(sql, "ALTER TABLE")
+	if createIdx == -1 || alterIdx == -1 || alterIdx < createIdx {
+		t.Fatalf("SQL should create the table before altering the primary key:\n%s", sql)
+	}
+
+	createSQL := sql[createIdx:alterIdx]
+	if strings.Contains(createSQL, "PRIMARY KEY") {
+		t.Fatalf("CREATE TABLE should not contain an inline primary key:\n%s", sql)
+	}
+	if !strings.Contains(createSQL, "[id] BIGINT NOT NULL") {
+		t.Fatalf("primary key column should be created NOT NULL:\n%s", sql)
+	}
+	if !strings.Contains(sql, "NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE parent_object_id = OBJECT_ID('dbo.events') AND [type] = 'PK')") {
+		t.Fatalf("SQL should retry missing primary key creation independently:\n%s", sql)
+	}
+	wantAlter := "ALTER TABLE [dbo].[events] ADD CONSTRAINT [PK_events] PRIMARY KEY NONCLUSTERED ([id]) NOT ENFORCED"
+	if !strings.Contains(sql, wantAlter) {
+		t.Fatalf("SQL missing Fabric primary key ALTER TABLE statement %q:\n%s", wantAlter, sql)
+	}
+}
+
+func TestBuildCreateTableSQLMatchesPrimaryKeysCaseInsensitively(t *testing.T) {
+	sql := buildCreateTableSQL("dbo.events", []schema.Column{
+		{Name: "id", DataType: schema.TypeInt64},
+	}, []string{"ID"})
+
+	if !strings.Contains(sql, "[id] BIGINT NOT NULL") {
+		t.Fatalf("primary key column should be created NOT NULL:\n%s", sql)
+	}
+	if !strings.Contains(sql, "PRIMARY KEY NONCLUSTERED ([ID]) NOT ENFORCED") {
+		t.Fatalf("SQL missing requested primary key spelling:\n%s", sql)
+	}
+}
+
+func TestBuildCreateTableSQLShortensPrimaryKeyConstraintName(t *testing.T) {
+	longTable := strings.Repeat("orders_", 30)
+	constraintName := buildPrimaryKeyConstraintName("dbo." + longTable)
+
+	if len(constraintName) > destination.MaxIdentifierLength("fabric") {
+		t.Fatalf("constraint name length = %d, want <= %d", len(constraintName), destination.MaxIdentifierLength("fabric"))
+	}
+	if !strings.HasPrefix(constraintName, "PK_") {
+		t.Fatalf("constraint name = %q, want PK_ prefix", constraintName)
+	}
+}
+
+func TestPrepareTableUsesFabricPrimaryKeyAlterTable(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	tableSchema := &schema.TableSchema{Columns: []schema.Column{
+		{Name: "id", DataType: schema.TypeInt64},
+		{Name: "payload", DataType: schema.TypeString},
+	}}
+	createSQL := buildCreateTableSQL("dbo.events", tableSchema.Columns, []string{"id"})
+	mock.ExpectExec(regexp.QuoteMeta(createSQL)).WillReturnResult(sqlmock.NewResult(0, 0))
+
+	dest := &FabricDestination{db: db}
+	err = dest.PrepareTable(t.Context(), destination.PrepareOptions{
+		Table:       "dbo.events",
+		Schema:      tableSchema,
+		PrimaryKeys: []string{"id"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBuildDeleteInsertDeleteSQLUsesTableLock(t *testing.T) {
+	sql := buildDeleteInsertDeleteSQL("dbo.events", "updated_at")
+
+	if !strings.Contains(sql, "DELETE FROM [dbo].[events] WITH (TABLOCKX, HOLDLOCK)") {
+		t.Fatalf("delete SQL missing table lock: %s", sql)
+	}
+	if !strings.Contains(sql, "[updated_at] >= @p1") || !strings.Contains(sql, "[updated_at] <= @p2") {
+		t.Fatalf("delete SQL missing interval predicate: %s", sql)
+	}
+}
+
+func mustExtractCopyValue(t *testing.T, arr arrow.Array, col *schema.Column) interface{} {
+	t.Helper()
+	value, err := extractCopyValue(arr, 0, col)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func TestExtractCopyValueReturnsDriverNativeTypes(t *testing.T) {
+	pool := memory.DefaultAllocator
+
+	boolBuilder := array.NewBooleanBuilder(pool)
+	boolBuilder.Append(true)
+	boolArray := boolBuilder.NewArray()
+	defer boolArray.Release()
+	boolBuilder.Release()
+
+	if got := mustExtractCopyValue(t, boolArray, nil); got != true {
+		t.Fatalf("expected bool true, got %T %v", got, got)
+	}
+
+	tsType := &arrow.TimestampType{Unit: arrow.Microsecond}
+	tsBuilder := array.NewTimestampBuilder(pool, tsType)
+	want := time.Date(2024, 1, 2, 3, 4, 5, 123456000, time.UTC)
+	tsBuilder.Append(arrow.Timestamp(want.UnixMicro()))
+	tsArray := tsBuilder.NewArray()
+	defer tsArray.Release()
+	tsBuilder.Release()
+
+	got := mustExtractCopyValue(t, tsArray, nil)
+	gotTime, ok := got.(time.Time)
+	if !ok {
+		t.Fatalf("expected time.Time, got %T %v", got, got)
+	}
+	if !gotTime.Equal(want) {
+		t.Fatalf("expected timestamp %v, got %v", want, gotTime)
+	}
+
+	dateBuilder := array.NewDate32Builder(pool)
+	dateBuilder.Append(arrow.Date32FromTime(time.Date(2024, 5, 6, 0, 0, 0, 0, time.UTC)))
+	dateArray := dateBuilder.NewArray()
+	defer dateArray.Release()
+	dateBuilder.Release()
+
+	if _, ok := mustExtractCopyValue(t, dateArray, nil).(time.Time); !ok {
+		t.Fatalf("expected date to convert to time.Time")
+	}
+
+	time64Type := &arrow.Time64Type{Unit: arrow.Microsecond}
+	time64Builder := array.NewTime64Builder(pool, time64Type)
+	time64Builder.Append(arrow.Time64(3723456789))
+	time64Array := time64Builder.NewArray()
+	defer time64Array.Release()
+	time64Builder.Release()
+
+	wantTime := time.Date(1, 1, 1, 1, 2, 3, 456789000, time.UTC)
+	if got := mustExtractCopyValue(t, time64Array, nil); !got.(time.Time).Equal(wantTime) {
+		t.Fatalf("expected time64 %v, got %T %v", wantTime, got, got)
+	}
+}
+
+func TestExtractCopyValueRejectsOutOfRangeTime(t *testing.T) {
+	// 25 hours in microseconds — a valid int64 but not a valid time-of-day. A
+	// second case uses the max int64 microsecond value, which would overflow and
+	// wrap into a small in-range duration if the range check ran after the
+	// multiplication by 1000.
+	for _, value := range []arrow.Time64{25 * 60 * 60 * 1_000_000, 9223372036854775807} {
+		time64Type := &arrow.Time64Type{Unit: arrow.Microsecond}
+		builder := array.NewTime64Builder(memory.DefaultAllocator, time64Type)
+		builder.Append(value)
+		arr := builder.NewArray()
+
+		if _, err := extractCopyValue(arr, 0, nil); err == nil {
+			t.Fatalf("expected out-of-range time error for value %d", value)
+		}
+
+		arr.Release()
+		builder.Release()
+	}
+}
+
+func TestExtractCopyValueConvertsUUIDStrings(t *testing.T) {
+	builder := array.NewStringBuilder(memory.DefaultAllocator)
+	builder.Append("01234567-89ab-cdef-0123-456789abcdef")
+	arr := builder.NewArray()
+	defer arr.Release()
+	builder.Release()
+
+	got := mustExtractCopyValue(t, arr, &schema.Column{DataType: schema.TypeUUID})
+	uuid, ok := got.(mssqldb.UniqueIdentifier)
+	if !ok {
+		t.Fatalf("expected UniqueIdentifier, got %T %v", got, got)
+	}
+	if uuid.String() != "01234567-89AB-CDEF-0123-456789ABCDEF" {
+		t.Fatalf("unexpected UUID value: %s", uuid.String())
+	}
+}
+
+func TestExtractCopyValueLeavesNonUUIDStringsUntouched(t *testing.T) {
+	builder := array.NewStringBuilder(memory.DefaultAllocator)
+	builder.Append("01234567-89ab-cdef-0123-456789abcdef")
+	arr := builder.NewArray()
+	defer arr.Release()
+	builder.Release()
+
+	// Without a UUID-typed column, the value must stay a plain string.
+	if got := mustExtractCopyValue(t, arr, &schema.Column{DataType: schema.TypeString}); got != "01234567-89ab-cdef-0123-456789abcdef" {
+		t.Fatalf("expected untouched string, got %T %v", got, got)
+	}
+}
+
+func TestExtractCopyValueRejectsInvalidUUIDStrings(t *testing.T) {
+	builder := array.NewStringBuilder(memory.DefaultAllocator)
+	builder.Append("not-a-uuid")
+	arr := builder.NewArray()
+	defer arr.Release()
+	builder.Release()
+
+	if _, err := extractCopyValue(arr, 0, &schema.Column{DataType: schema.TypeUUID}); err == nil {
+		t.Fatal("expected invalid UUID error")
+	}
+}
+
+func TestExtractCopyValueReturnsNilForNulls(t *testing.T) {
+	builder := array.NewStringBuilder(memory.DefaultAllocator)
+	builder.AppendNull()
+	arr := builder.NewArray()
+	defer arr.Release()
+	builder.Release()
+
+	if got := mustExtractCopyValue(t, arr, nil); got != nil {
+		t.Fatalf("expected nil, got %T %v", got, got)
+	}
+}
+
+func TestColumnsForRecordMapsByCaseInsensitiveName(t *testing.T) {
+	pool := memory.DefaultAllocator
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "ID", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "unmatched", Type: arrow.BinaryTypes.String},
+	}, nil)
+
+	idBuilder := array.NewInt64Builder(pool)
+	idBuilder.Append(1)
+	idArray := idBuilder.NewArray()
+	defer idArray.Release()
+	idBuilder.Release()
+
+	strBuilder := array.NewStringBuilder(pool)
+	strBuilder.Append("x")
+	strArray := strBuilder.NewArray()
+	defer strArray.Release()
+	strBuilder.Release()
+
+	record := array.NewRecordBatch(arrowSchema, []arrow.Array{idArray, strArray}, 1)
+	defer record.Release()
+
+	tableSchema := &schema.TableSchema{Columns: []schema.Column{{Name: "id", DataType: schema.TypeInt64}}}
+	cols := columnsForRecord(record, tableSchema)
+
+	if len(cols) != 2 {
+		t.Fatalf("expected 2 columns, got %d", len(cols))
+	}
+	if cols[0] == nil || cols[0].DataType != schema.TypeInt64 {
+		t.Fatalf("expected first column mapped to id (int64), got %+v", cols[0])
+	}
+	if cols[1] != nil {
+		t.Fatalf("expected unmatched column to map to nil, got %+v", cols[1])
+	}
+}
+
+func TestNormalizeSchemaEvolutionColumn(t *testing.T) {
+	d := &FabricDestination{}
+
+	// TimestampTZ and Timestamp both store as DATETIME2, so they must normalize
+	// to the same logical type Fabric recovers on read-back.
+	if got := d.NormalizeSchemaEvolutionColumn(schema.Column{DataType: schema.TypeTimestampTZ}); got.DataType != schema.TypeTimestamp {
+		t.Fatalf("TimestampTZ should normalize to Timestamp, got %v", got.DataType)
+	}
+	// Int8 and Int16 both store as SMALLINT.
+	if got := d.NormalizeSchemaEvolutionColumn(schema.Column{DataType: schema.TypeInt8}); got.DataType != schema.TypeInt16 {
+		t.Fatalf("Int8 should normalize to Int16, got %v", got.DataType)
+	}
+	// Distinguishable types are left alone.
+	if got := d.NormalizeSchemaEvolutionColumn(schema.Column{DataType: schema.TypeInt64}); got.DataType != schema.TypeInt64 {
+		t.Fatalf("Int64 should be unchanged, got %v", got.DataType)
+	}
+	// Precision/scale/length are preserved so genuine widenings still surface.
+	dec := d.NormalizeSchemaEvolutionColumn(schema.Column{DataType: schema.TypeDecimal, Precision: 18, Scale: 4})
+	if dec.Precision != 18 || dec.Scale != 4 {
+		t.Fatalf("decimal precision/scale should be preserved, got %+v", dec)
+	}
+	str := d.NormalizeSchemaEvolutionColumn(schema.Column{DataType: schema.TypeString, MaxLength: 255})
+	if str.MaxLength != 255 {
+		t.Fatalf("string length should be preserved, got %+v", str)
+	}
+}
+
+func TestSchemaEvolutionNoPhantomTimestampTZChange(t *testing.T) {
+	d := &FabricDestination{}
+	desired := &schema.TableSchema{Columns: []schema.Column{
+		{Name: "id", DataType: schema.TypeInt64},
+		{Name: naming.IngestrLoadedAtColumn, DataType: schema.TypeTimestampTZ, Nullable: true},
+	}}
+	existing := &schema.TableSchema{Columns: []schema.Column{
+		{Name: "id", DataType: schema.TypeInt64},
+		{Name: naming.IngestrLoadedAtColumn, DataType: schema.TypeTimestamp, Nullable: true},
+	}}
+
+	withNormalizer, err := schemaevolution.Compare(desired, existing, &schemaevolution.CompareOptions{
+		NormalizeColumn: d.NormalizeSchemaEvolutionColumn,
+	})
+	if err != nil {
+		t.Fatalf("compare: %v", err)
+	}
+	if withNormalizer.HasChanges {
+		t.Fatalf("expected no changes with normalizer, got %+v", withNormalizer.Changes)
+	}
+
+	without, err := schemaevolution.Compare(desired, existing, nil)
+	if err != nil {
+		t.Fatalf("compare: %v", err)
+	}
+	if !without.HasChanges {
+		t.Fatal("expected a phantom change without the normalizer")
+	}
+}
+
+func TestSchemaEvolutionSkipsUnchangedFabricType(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create mock database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	d := &FabricDestination{db: db}
+	oldColumn := schema.Column{Name: "clause_names", DataType: schema.TypeString, MaxLength: -1, Nullable: true}
+	comparison := &schemaevolution.SchemaComparison{HasChanges: true, Changes: []schemaevolution.SchemaChange{{
+		Type:       schemaevolution.ChangeWidenType,
+		ColumnName: "clause_names",
+		OldColumn:  &oldColumn,
+		NewColumn:  schema.Column{Name: "clause_names", DataType: schema.TypeArray, ArrayType: schema.TypeString, Nullable: true},
+	}}}
+
+	_, err = d.ApplySchemaEvolution(context.Background(), "dbo.events", comparison)
+	if err != nil {
+		t.Fatalf("apply schema evolution: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSchemaEvolutionAttemptsTypeChange(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create mock database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	d := &FabricDestination{db: db}
+	oldColumn := schema.Column{Name: "value", DataType: schema.TypeInt32, Nullable: true}
+	comparison := &schemaevolution.SchemaComparison{HasChanges: true, Changes: []schemaevolution.SchemaChange{{
+		Type:       schemaevolution.ChangeWidenType,
+		ColumnName: "value",
+		OldColumn:  &oldColumn,
+		NewColumn:  schema.Column{Name: "value", DataType: schema.TypeInt64, Nullable: true},
+	}}}
+	query := "ALTER TABLE dbo.events ALTER COLUMN [value] BIGINT NULL"
+	mock.ExpectExec(regexp.QuoteMeta(query)).WillReturnResult(sqlmock.NewResult(0, 0))
+
+	_, err = d.ApplySchemaEvolution(context.Background(), "dbo.events", comparison)
+	if err != nil {
+		t.Fatalf("apply schema evolution: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSchemaEvolutionTypeChangeFailureIncludesQuery(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create mock database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	d := &FabricDestination{db: db}
+	oldColumn := schema.Column{Name: "value", DataType: schema.TypeInt32, Nullable: true}
+	comparison := &schemaevolution.SchemaComparison{HasChanges: true, Changes: []schemaevolution.SchemaChange{{
+		Type:       schemaevolution.ChangeWidenType,
+		ColumnName: "value",
+		OldColumn:  &oldColumn,
+		NewColumn:  schema.Column{Name: "value", DataType: schema.TypeInt64, Nullable: true},
+	}}}
+	query := "ALTER TABLE dbo.events ALTER COLUMN [value] BIGINT NULL"
+	mock.ExpectExec(regexp.QuoteMeta(query)).WillReturnError(errors.New("Fabric rejected conversion"))
+
+	_, err = d.ApplySchemaEvolution(context.Background(), "dbo.events", comparison)
+	if err == nil || !strings.Contains(err.Error(), query) || !strings.Contains(err.Error(), "Fabric rejected conversion") {
+		t.Fatalf("expected query and Fabric error, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}

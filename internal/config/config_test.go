@@ -1,0 +1,653 @@
+package config
+
+import (
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestResolveWriteNulls(t *testing.T) {
+	cases := []struct {
+		name          string
+		reverseETL    bool
+		writeNullsSet bool
+		writeNulls    bool
+		want          bool
+	}{
+		{"reverse-etl unset clears by default", true, false, false, true},
+		{"reverse-etl explicit false omits", true, true, false, false},
+		{"reverse-etl explicit true clears", true, true, true, true},
+		{"non-reverse-etl unset passes through", false, false, false, false},
+		{"non-reverse-etl value passes through", false, true, true, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ResolveWriteNulls(c.reverseETL, c.writeNullsSet, c.writeNulls); got != c.want {
+				t.Fatalf("ResolveWriteNulls(%v,%v,%v) = %v, want %v", c.reverseETL, c.writeNullsSet, c.writeNulls, got, c.want)
+			}
+		})
+	}
+}
+
+func TestEffectiveDestinationParallelism(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  IngestConfig
+		want int
+	}{
+		{
+			name: "postgres default",
+			cfg:  IngestConfig{DestURI: "postgres://localhost/db", ExtractParallelism: 5},
+			want: 8,
+		},
+		{
+			name: "postgres alias default",
+			cfg:  IngestConfig{DestURI: "postgresql+psycopg2://localhost/db", ExtractParallelism: 5},
+			want: 8,
+		},
+		{
+			name: "explicit destination value",
+			cfg:  IngestConfig{DestURI: "postgres://localhost/db", ExtractParallelism: 5, DestinationParallelism: 5},
+			want: 5,
+		},
+		{
+			name: "non-default postgres extraction",
+			cfg:  IngestConfig{DestURI: "postgres://localhost/db", ExtractParallelism: 3},
+			want: 3,
+		},
+		{
+			name: "other destination",
+			cfg:  IngestConfig{DestURI: "duckdb:///tmp/test.db", ExtractParallelism: 5},
+			want: 5,
+		},
+		{
+			name: "fallback",
+			cfg:  IngestConfig{DestURI: "postgres://localhost/db"},
+			want: 4,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.cfg.EffectiveDestinationParallelism(); got != test.want {
+				t.Fatalf("EffectiveDestinationParallelism() = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestIngestConfigValidate_NoInferenceRequiresColumns(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.SourceURI = "mongodb://localhost:27017/db"
+	cfg.SourceTable = "db.users"
+	cfg.DestURI = "duckdb://out.duckdb"
+	cfg.NoInference = true
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected validation error, got nil")
+	}
+	if !strings.Contains(err.Error(), "columns") {
+		t.Fatalf("expected columns validation error, got %v", err)
+	}
+}
+
+func TestIngestConfigValidate_NoInferenceWithColumns(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.SourceURI = "mongodb://localhost:27017/db"
+	cfg.SourceTable = "db.users"
+	cfg.DestURI = "duckdb://out.duckdb"
+	cfg.Columns = "_id:string,name:string"
+	cfg.NoInference = true
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestIngestConfigValidate_RemovedTruncateInsert(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.SourceURI = "postgres://localhost/db"
+	cfg.SourceTable = "public.items"
+	cfg.DestURI = "duckdb://out.duckdb"
+	cfg.IncrementalStrategy = IncrementalStrategy("truncate+insert")
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected validation error, got nil")
+	}
+	if !strings.Contains(err.Error(), "incremental-strategy") {
+		t.Fatalf("expected incremental-strategy validation error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), `"truncate+insert" has been removed; use "replace"`) {
+		t.Fatalf("expected removal message, got %v", err)
+	}
+}
+
+func TestIngestConfigValidate_TableNaming(t *testing.T) {
+	newCDCConfig := func() *IngestConfig {
+		cfg := DefaultConfig()
+		cfg.SourceURI = "postgres+cdc://localhost/db?dest_schema=foo_cdc"
+		cfg.DestURI = "duckdb://out.duckdb"
+		return cfg
+	}
+
+	t.Run("default passes", func(t *testing.T) {
+		if err := newCDCConfig().Validate(); err != nil {
+			t.Fatalf("Validate() error = %v", err)
+		}
+	})
+
+	t.Run("empty passes", func(t *testing.T) {
+		cfg := newCDCConfig()
+		cfg.CDCTableNaming = ""
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() error = %v", err)
+		}
+	})
+
+	t.Run("table mode passes for multi-table run", func(t *testing.T) {
+		cfg := newCDCConfig()
+		cfg.CDCTableNaming = TableNamingTable
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() error = %v", err)
+		}
+	})
+
+	t.Run("table mode passes for a table subset", func(t *testing.T) {
+		cfg := newCDCConfig()
+		cfg.SourceTables = []string{"foo.a", "foo.b"}
+		cfg.CDCTableNaming = TableNamingTable
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() error = %v", err)
+		}
+	})
+
+	t.Run("table mode rejected for single-table run", func(t *testing.T) {
+		cfg := newCDCConfig()
+		cfg.SourceTable = "foo.a"
+		cfg.CDCTableNaming = TableNamingTable
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected validation error, got nil")
+		}
+		if !strings.Contains(err.Error(), "cdc-table-naming") || !strings.Contains(err.Error(), "multi-table") {
+			t.Fatalf("expected cdc-table-naming multi-table error, got %v", err)
+		}
+	})
+
+	t.Run("unknown value rejected", func(t *testing.T) {
+		cfg := newCDCConfig()
+		cfg.CDCTableNaming = TableNaming("unqualified")
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected validation error, got nil")
+		}
+		if !strings.Contains(err.Error(), "cdc-table-naming") || !strings.Contains(err.Error(), "invalid value") {
+			t.Fatalf("expected invalid cdc-table-naming error, got %v", err)
+		}
+	})
+}
+
+func TestIngestConfigValidate_IncrementalPredicateDefersStrategyValidation(t *testing.T) {
+	newCfg := func() *IngestConfig {
+		cfg := DefaultConfig()
+		cfg.SourceURI = "duckdb:///tmp/source.duckdb"
+		cfg.SourceTable = "users"
+		cfg.DestURI = "bigquery://project/dataset"
+		cfg.IncrementalPredicate = "t.event_date >= DATE '2026-07-01'"
+		return cfg
+	}
+
+	cfg := newCfg()
+	cfg.IncrementalStrategy = StrategyAppend
+	cfg.IncrementalStrategyExplicit = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	cfg = newCfg()
+	cfg.IncrementalStrategy = StrategyMerge
+	cfg.IncrementalStrategyExplicit = true
+	cfg.FullRefresh = true
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "incremental-predicate") {
+		t.Fatalf("expected incremental-predicate validation error with full-refresh, got %v", err)
+	}
+
+	cfg = newCfg()
+	cfg.IncrementalStrategy = StrategyMerge
+	cfg.IncrementalStrategyExplicit = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	// Sources can resolve an explicit caller strategy to merge, so the pipeline
+	// validates the strategy after source-table resolution.
+	cfg = newCfg()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestIngestConfigValidate_Stream(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name    string
+		mutate  func(c *IngestConfig)
+		wantErr string
+	}{
+		{
+			name:   "valid defaults",
+			mutate: func(c *IngestConfig) {},
+		},
+		{
+			name:    "full refresh rejected",
+			mutate:  func(c *IngestConfig) { c.FullRefresh = true },
+			wantErr: "full-refresh",
+		},
+		{
+			name:    "interval end rejected",
+			mutate:  func(c *IngestConfig) { c.IntervalEnd = &now },
+			wantErr: "interval-end",
+		},
+		{
+			name:    "sql limit rejected",
+			mutate:  func(c *IngestConfig) { c.SQLLimit = 100 },
+			wantErr: "sql-limit",
+		},
+		{
+			name:    "non-positive flush interval rejected",
+			mutate:  func(c *IngestConfig) { c.FlushInterval = 0 },
+			wantErr: "flush-interval",
+		},
+		{
+			name:    "non-positive flush records rejected",
+			mutate:  func(c *IngestConfig) { c.FlushRecords = -1 },
+			wantErr: "flush-records",
+		},
+		{
+			name:    "replace strategy rejected",
+			mutate:  func(c *IngestConfig) { c.IncrementalStrategy = StrategyReplace },
+			wantErr: "incremental-strategy",
+		},
+		{
+			name:    "scd2 strategy rejected",
+			mutate:  func(c *IngestConfig) { c.IncrementalStrategy = StrategySCD2 },
+			wantErr: "incremental-strategy",
+		},
+		{
+			name:   "merge strategy allowed",
+			mutate: func(c *IngestConfig) { c.IncrementalStrategy = StrategyMerge },
+		},
+		{
+			name:   "append strategy allowed",
+			mutate: func(c *IngestConfig) { c.IncrementalStrategy = StrategyAppend },
+		},
+		{
+			name:   "empty strategy allowed",
+			mutate: func(c *IngestConfig) { c.IncrementalStrategy = "" },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.SourceURI = "postgres+cdc://localhost:5432/db"
+			cfg.DestURI = "duckdb://out.duckdb"
+			cfg.Stream = true
+			cfg.IncrementalStrategy = ""
+			tt.mutate(cfg)
+
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected validation error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestIngestConfigValidate_CDCMode(t *testing.T) {
+	tests := []struct {
+		name    string
+		uri     string
+		stream  bool
+		wantErr string
+	}{
+		{
+			name: "no mode parameter",
+			uri:  "postgres+cdc://localhost:5432/db?publication=p",
+		},
+		{
+			name: "mode=batch is a no-op",
+			uri:  "postgres+cdc://localhost:5432/db?mode=batch",
+		},
+		{
+			name:    "mode=stream without --stream is rejected",
+			uri:     "postgres+cdc://localhost:5432/db?mode=stream",
+			wantErr: "mode=stream is no longer supported",
+		},
+		{
+			name:   "mode=stream with --stream is tolerated",
+			uri:    "postgres+cdc://localhost:5432/db?mode=stream",
+			stream: true,
+		},
+		{
+			name:    "unknown mode is rejected",
+			uri:     "mssql+cdc://example:1433/app?mode=once",
+			wantErr: "invalid mode",
+		},
+		{
+			name:    "mode is case-insensitive",
+			uri:     "mongodb+cdc://localhost:27017/app?mode=STREAM",
+			wantErr: "mode=stream is no longer supported",
+		},
+		{
+			name: "mode on a non-CDC source is ignored",
+			uri:  "postgres://localhost:5432/db?mode=stream",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.SourceURI = tt.uri
+			cfg.SourceTable = "public.users"
+			cfg.DestURI = "duckdb:///tmp/out.duckdb"
+			if tt.stream {
+				cfg.Stream = true
+				cfg.IncrementalStrategy = ""
+			}
+
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected validation error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestIngestConfigValidate_ChangeTrackingRejectsSQLLimit(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.SourceURI = "mssql+ct://example:1433/app"
+	cfg.SourceTable = "dbo.users"
+	cfg.DestURI = "duckdb:///tmp/out.duckdb"
+	cfg.SQLLimit = 10
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected validation error, got nil")
+	}
+	if !strings.Contains(err.Error(), "sql-limit") {
+		t.Fatalf("expected sql-limit validation error, got %v", err)
+	}
+}
+
+func TestIngestConfigValidate_ExtractPartitioning(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := start.Add(24 * time.Hour)
+
+	tests := []struct {
+		name    string
+		mutate  func(*IngestConfig)
+		wantErr string
+	}{
+		{
+			name: "valid",
+		},
+		{
+			name:   "valid numeric interval",
+			mutate: func(c *IngestConfig) { c.ExtractPartitionInterval = 0; c.ExtractPartitionNumericInterval = 1000 },
+		},
+		{
+			name: "valid auto interval",
+			mutate: func(c *IngestConfig) {
+				c.ExtractPartitionInterval = 0
+				c.ExtractPartitionAuto = true
+			},
+		},
+		{
+			name: "valid full numeric bounds discovery",
+			mutate: func(c *IngestConfig) {
+				c.IntervalStart = nil
+				c.IntervalEnd = nil
+				c.ExtractPartitionInterval = 0
+				c.ExtractPartitionAuto = true
+			},
+		},
+		{
+			name:    "mixed interval modes rejected",
+			mutate:  func(c *IngestConfig) { c.ExtractPartitionAuto = true },
+			wantErr: "extract-partition-interval",
+		},
+		{
+			name:    "missing column",
+			mutate:  func(c *IngestConfig) { c.ExtractPartitionBy = "" },
+			wantErr: "extract-partition-by",
+		},
+		{
+			name:    "missing interval",
+			mutate:  func(c *IngestConfig) { c.ExtractPartitionInterval = 0 },
+			wantErr: "extract-partition-interval",
+		},
+		{
+			name:    "missing interval start",
+			mutate:  func(c *IngestConfig) { c.IncrementalKey = "updated_at"; c.IntervalStart = nil },
+			wantErr: "interval-start",
+		},
+		{
+			name:    "missing interval end",
+			mutate:  func(c *IngestConfig) { c.IncrementalKey = "updated_at"; c.IntervalEnd = nil },
+			wantErr: "interval-end",
+		},
+		{
+			name:    "sql limit rejected",
+			mutate:  func(c *IngestConfig) { c.SQLLimit = 10 },
+			wantErr: "sql-limit",
+		},
+		{
+			name:    "stream rejected",
+			mutate:  func(c *IngestConfig) { c.Stream = true; c.IncrementalStrategy = "" },
+			wantErr: "stream",
+		},
+		{
+			name:    "cdc rejected",
+			mutate:  func(c *IngestConfig) { c.SourceURI = "postgres+cdc://localhost/db" },
+			wantErr: "source-uri",
+		},
+		{
+			name:    "change tracking rejected",
+			mutate:  func(c *IngestConfig) { c.SourceURI = "mssql+ct://localhost/db" },
+			wantErr: "source-uri",
+		},
+		{
+			name:   "custom query accepted",
+			mutate: func(c *IngestConfig) { c.SourceTable = "query:select * from orders" },
+		},
+		{
+			name:    "full refresh rejected",
+			mutate:  func(c *IngestConfig) { c.FullRefresh = true },
+			wantErr: "full-refresh",
+		},
+		{
+			name:   "replace accepted",
+			mutate: func(c *IngestConfig) { c.IncrementalStrategy = StrategyReplace },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.SourceURI = "postgres://localhost/db"
+			cfg.SourceTable = "public.orders"
+			cfg.DestURI = "duckdb:///tmp/out.duckdb"
+			cfg.IntervalStart = &start
+			cfg.IntervalEnd = &end
+			cfg.ExtractPartitionBy = "created_at"
+			cfg.ExtractPartitionInterval = 7 * 24 * time.Hour
+			cfg.IncrementalStrategy = StrategyMerge
+			if tt.mutate != nil {
+				tt.mutate(cfg)
+			}
+
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestIngestConfigValidate_ChangeTrackingRejectsExplicitReplace(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.SourceURI = "mssql+ct://example:1433/app"
+	cfg.SourceTable = "dbo.users"
+	cfg.DestURI = "duckdb:///tmp/out.duckdb"
+	cfg.IncrementalStrategy = StrategyReplace
+	cfg.IncrementalStrategyExplicit = true
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected validation error, got nil")
+	}
+	if !strings.Contains(err.Error(), "incremental-strategy") {
+		t.Fatalf("expected incremental-strategy validation error, got %v", err)
+	}
+}
+
+func TestIngestConfigValidate_ChangeTrackingAllowsDefaultReplace(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.SourceURI = "mssql+ct://example:1433/app"
+	cfg.SourceTable = "dbo.users"
+	cfg.DestURI = "duckdb:///tmp/out.duckdb"
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestIngestConfigValidate_ChangeTrackingAllowsExplicitReplaceWithFullRefresh(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.SourceURI = "mssql+ct://example:1433/app"
+	cfg.SourceTable = "dbo.users"
+	cfg.DestURI = "duckdb:///tmp/out.duckdb"
+	cfg.IncrementalStrategy = StrategyReplace
+	cfg.IncrementalStrategyExplicit = true
+	cfg.FullRefresh = true
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestIngestConfigValidate_SourceTables(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(c *IngestConfig)
+		wantErr string
+	}{
+		{
+			name:   "valid subset",
+			mutate: func(c *IngestConfig) { c.SourceTables = []string{"users", "orders"} },
+		},
+		{
+			name: "single table is unaffected",
+			mutate: func(c *IngestConfig) {
+				c.SourceTable = "users"
+			},
+		},
+		{
+			name: "cannot combine with a single table",
+			mutate: func(c *IngestConfig) {
+				c.SourceTable = "users"
+				c.SourceTables = []string{"users", "orders"}
+			},
+			wantErr: "both a single table and a table list",
+		},
+		{
+			name: "non-cdc source rejected",
+			mutate: func(c *IngestConfig) {
+				c.SourceURI = "postgres://localhost:5432/db"
+				c.SourceTables = []string{"users", "orders"}
+			},
+			wantErr: "CDC sources only",
+		},
+		{
+			name:    "single-entry list rejected",
+			mutate:  func(c *IngestConfig) { c.SourceTables = []string{"users"} },
+			wantErr: "at least two tables",
+		},
+		{
+			name:    "blank entry rejected",
+			mutate:  func(c *IngestConfig) { c.SourceTables = []string{"users", " "} },
+			wantErr: "empty entry",
+		},
+		{
+			name:    "duplicate entry rejected",
+			mutate:  func(c *IngestConfig) { c.SourceTables = []string{"users", "users"} },
+			wantErr: "repeats users",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.SourceURI = "postgres+cdc://localhost:5432/db"
+			cfg.DestURI = "duckdb://out.duckdb"
+			tt.mutate(cfg)
+
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestIngestConfigValidate_SubsetLeavesDestTableEmpty(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.SourceURI = "postgres+cdc://localhost:5432/db"
+	cfg.DestURI = "duckdb://out.duckdb"
+	cfg.SourceTables = []string{"users", "orders"}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Multi-table runs derive each destination table from the source table, so
+	// DestTable must not be defaulted to a joined name.
+	if cfg.DestTable != "" {
+		t.Fatalf("DestTable = %q, want empty", cfg.DestTable)
+	}
+}

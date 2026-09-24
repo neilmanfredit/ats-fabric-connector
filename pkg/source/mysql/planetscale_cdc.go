@@ -1,0 +1,1112 @@
+package mysql
+
+import (
+	"context"
+	"database/sql"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"reflect"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/bruin-data/ingestr/internal/config"
+	"github.com/bruin-data/ingestr/pkg/schema"
+	"github.com/bruin-data/ingestr/pkg/source"
+	psdbconnect "github.com/bruin-data/ingestr/pkg/source/mysql/internal/psdbconnect"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/protobuf/proto"
+	"vitess.io/vitess/go/sqltypes"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+)
+
+// PlanetScaleCDCSource captures changes from a PlanetScale (managed Vitess)
+// keyspace. PlanetScale does not expose vtgate's raw VStream port; instead it
+// fronts change capture with the psdbconnect gRPC API on the database host over
+// TLS/443, authenticated with the database credentials from the URI. Schema/PK/
+// shard discovery still uses the MySQL wire protocol.
+//
+// It emits the same Arrow batches and CDC metadata columns (_cdc_lsn,
+// _cdc_deleted, _cdc_synced_at) as the other CDC sources, reusing the in-package
+// change-buffer and batching helpers.
+type PlanetScaleCDCSource struct {
+	db         *sql.DB
+	keyspace   string
+	destSchema string
+	selection  *source.TableSelection
+	host       string
+	username   string
+	password   string
+}
+
+func NewPlanetScaleCDCSource() *PlanetScaleCDCSource {
+	return &PlanetScaleCDCSource{}
+}
+
+func (s *PlanetScaleCDCSource) Schemes() []string {
+	return []string{"ps_mysql+cdc"}
+}
+
+func (s *PlanetScaleCDCSource) Connect(ctx context.Context, uri string) error {
+	cfg, normalizedURI, connInfo, err := parseMySQLCDCURI(uri)
+	if err != nil {
+		return fmt.Errorf("failed to parse PlanetScale CDC URI: %w", err)
+	}
+	if connInfo.Database == "" {
+		return fmt.Errorf("source URI must include a keyspace (database) for PlanetScale CDC")
+	}
+	if connInfo.Host == "" {
+		return fmt.Errorf("source URI must include the PlanetScale host")
+	}
+	if connInfo.User == "" || connInfo.Password == "" {
+		return fmt.Errorf("PlanetScale CDC requires database credentials (user:password) in the source URI")
+	}
+
+	dsn, database, err := uriToDSN(normalizedURI)
+	if err != nil {
+		return fmt.Errorf("failed to parse MySQL URI: %w", err)
+	}
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return fmt.Errorf("failed to open MySQL connection: %w", err)
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return fmt.Errorf("failed to ping PlanetScale (vtgate): %w", err)
+	}
+
+	s.db = db
+	s.keyspace = database
+	s.destSchema = cfg.DestSchema
+	s.host = connInfo.Host
+	s.username = connInfo.User
+	s.password = connInfo.Password
+	return nil
+}
+
+func (s *PlanetScaleCDCSource) Close(ctx context.Context) error {
+	if s.db != nil {
+		return s.db.Close()
+	}
+	return nil
+}
+
+func (s *PlanetScaleCDCSource) HandlesIncrementality() bool {
+	return true
+}
+
+func (s *PlanetScaleCDCSource) SupportsStreaming() bool {
+	return true
+}
+
+func (s *PlanetScaleCDCSource) DefaultStreamingStrategy() config.IncrementalStrategy {
+	return config.StrategyMerge
+}
+
+func (s *PlanetScaleCDCSource) GetTable(ctx context.Context, req source.TableRequest) (source.SourceTable, error) {
+	if req.Name == "" {
+		return nil, fmt.Errorf("table name is required")
+	}
+
+	fullSchema, err := getMySQLSchema(ctx, s.db, s.keyspace, req.Name)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateMySQLCDCTableSupported(ctx, s.db, s.keyspace, req.Name); err != nil {
+		return nil, err
+	}
+	tableSchema := addMySQLCDCColumns(fullSchema)
+
+	pks := req.PrimaryKeys
+	if len(pks) == 0 {
+		pks = tableSchema.PrimaryKeys
+	}
+	if len(pks) == 0 {
+		return nil, fmt.Errorf("table %s has no primary key; provide --primary-key or add a primary key to the source table", req.Name)
+	}
+	tableSchema.PrimaryKeys = pks
+
+	strategy := config.StrategyMerge
+	if req.Strategy != "" && req.Strategy != config.StrategyReplace {
+		strategy = req.Strategy
+	}
+
+	return &PlanetScaleCDCTable{
+		source:      s,
+		tableName:   req.Name,
+		tableSchema: tableSchema,
+		primaryKeys: pks,
+		strategy:    strategy,
+	}, nil
+}
+
+func (s *PlanetScaleCDCSource) IsMultiTable() bool {
+	return true
+}
+
+func (s *PlanetScaleCDCSource) GetTables(ctx context.Context) ([]source.SourceTableInfo, error) {
+	return s.getTables(ctx)
+}
+
+// planetScaleTableSelectionOptions describes how this source names its tables. Names
+// are bare, so an optional keyspace prefix is stripped.
+var planetScaleTableSelectionOptions = source.TableSelectionOptions{
+	Subject:      "PlanetScale CDC table",
+	Scope:        "the keyspace's tables",
+	Canonicalize: bareTableName,
+}
+
+// SelectTables restricts this source to the named tables.
+func (s *PlanetScaleCDCSource) SelectTables(names []string) error {
+	selection, err := source.NewTableSelection(names, planetScaleTableSelectionOptions)
+	if err != nil {
+		return err
+	}
+	s.selection = selection
+	return nil
+}
+
+func (s *PlanetScaleCDCSource) getTables(ctx context.Context) ([]source.SourceTableInfo, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT TABLE_NAME
+		FROM INFORMATION_SCHEMA.TABLES
+		WHERE TABLE_SCHEMA = ?
+		  AND TABLE_TYPE = 'BASE TABLE'
+		ORDER BY TABLE_NAME
+	`, s.keyspace)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query PlanetScale tables: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var inventory []string
+	for rows.Next() {
+		var tableName string
+		if err := rows.Scan(&tableName); err != nil {
+			return nil, fmt.Errorf("failed to scan PlanetScale table: %w", err)
+		}
+		inventory = append(inventory, tableName)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Resolve before the per-table schema and support checks: an unselected
+	// table costs nothing, and a keyless table outside the selection no longer
+	// blocks the whole keyspace.
+	selected, err := s.selection.Resolve(inventory)
+	if err != nil {
+		return nil, err
+	}
+
+	tables := make([]source.SourceTableInfo, 0, len(selected))
+	for _, tableName := range inventory {
+		if _, ok := selected[tableName]; !ok {
+			continue
+		}
+
+		fullSchema, err := getMySQLSchema(ctx, s.db, s.keyspace, tableName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get schema for %s: %w", tableName, err)
+		}
+		if err := validateMySQLCDCTableSupported(ctx, s.db, s.keyspace, tableName); err != nil {
+			return nil, err
+		}
+		tableSchema := addMySQLCDCColumns(fullSchema)
+		if len(tableSchema.PrimaryKeys) == 0 {
+			return nil, fmt.Errorf("table %s has no primary key; multi-table PlanetScale CDC requires source primary keys", tableName)
+		}
+
+		tables = append(tables, source.SourceTableInfo{
+			Name:        tableName,
+			Schema:      tableSchema,
+			PrimaryKeys: tableSchema.PrimaryKeys,
+			DestSchema:  s.destSchema,
+		})
+	}
+	names := make([]string, 0, len(tables))
+	for _, table := range tables {
+		names = append(names, table.Name)
+	}
+	if err := s.selection.Validate(names, nil); err != nil {
+		return nil, err
+	}
+	if len(tables) == 0 {
+		return nil, fmt.Errorf("no PlanetScale tables found in keyspace %s", s.keyspace)
+	}
+	return tables, nil
+}
+
+func (s *PlanetScaleCDCSource) ReadAll(ctx context.Context, opts source.MultiTableReadOptions) (<-chan source.RecordBatchResult, error) {
+	all, err := s.getTables(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	targets := make([]psdbCDCTarget, 0, len(all))
+	resumeByTable := make(map[string]string, len(all))
+	for _, info := range all {
+		_, bare := parseMySQLTableName(s.keyspace, info.Name)
+		targets = append(targets, psdbCDCTarget{bareName: bare, resultName: info.Name, schema: info.Schema})
+		if lsn := strings.TrimSpace(opts.CDCResumeLSNs[info.Name]); lsn != "" {
+			resumeByTable[bare] = lsn
+		}
+	}
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("no PlanetScale tables selected")
+	}
+
+	results := make(chan source.RecordBatchResult, 16)
+	go func() {
+		defer close(results)
+		if err := s.runPsdbConnect(ctx, targets, resumeByTable, opts.ReadOptions, results); err != nil {
+			results <- source.RecordBatchResult{Err: err}
+		}
+	}()
+	return results, nil
+}
+
+// PlanetScaleCDCTable is the single-table SourceTable for PlanetScale CDC.
+type PlanetScaleCDCTable struct {
+	source      *PlanetScaleCDCSource
+	tableName   string
+	tableSchema *schema.TableSchema
+	primaryKeys []string
+	strategy    config.IncrementalStrategy
+}
+
+func (t *PlanetScaleCDCTable) Name() string                         { return t.tableName }
+func (t *PlanetScaleCDCTable) PrimaryKeys() []string                { return t.primaryKeys }
+func (t *PlanetScaleCDCTable) IncrementalKey() string               { return "" }
+func (t *PlanetScaleCDCTable) Strategy() config.IncrementalStrategy { return t.strategy }
+func (t *PlanetScaleCDCTable) HasKnownSchema() bool                 { return true }
+
+func (t *PlanetScaleCDCTable) GetSchema(ctx context.Context) (*schema.TableSchema, error) {
+	return t.tableSchema, nil
+}
+
+func (t *PlanetScaleCDCTable) Read(ctx context.Context, opts source.ReadOptions) (<-chan source.RecordBatchResult, error) {
+	outputSchema := t.tableSchema
+	if opts.Schema != nil {
+		outputSchema = opts.Schema
+	}
+
+	results := make(chan source.RecordBatchResult, 8)
+	go func() {
+		defer close(results)
+		_, bare := parseMySQLTableName(t.source.keyspace, t.tableName)
+		target := psdbCDCTarget{bareName: bare, resultName: "", schema: outputSchema}
+		resumeByTable := map[string]string{}
+		if lsn := strings.TrimSpace(opts.CDCResumeLSN); lsn != "" {
+			resumeByTable[bare] = lsn
+		}
+		if err := t.source.runPsdbConnect(ctx, []psdbCDCTarget{target}, resumeByTable, opts, results); err != nil {
+			results <- source.RecordBatchResult{Err: err}
+		}
+	}()
+	return results, nil
+}
+
+const (
+	// psdbRecvStallTimeout bounds how long a Sync stream may go without any
+	// response before the run fails with a diagnosable error instead of hanging.
+	// PlanetScale's vttablet heartbeat writes advance every shard's GTID about
+	// once a second, so a healthy stream always produces cursor updates well
+	// within this window even when the captured table itself is idle.
+	psdbRecvStallTimeout = 2 * time.Minute
+	// psdbPeekTimeout bounds the short-lived "current position" Sync used to
+	// establish the batch-capture stop boundary.
+	psdbPeekTimeout = 30 * time.Second
+)
+
+// psdbResumeHint suggests --full-refresh on stream errors for resumed cursors,
+// which is how a purged/expired GTID position typically surfaces.
+func psdbResumeHint(start *psdbconnect.TableCursor) string {
+	if start.GetPosition() == "" && start.GetLastKnownPk() == nil {
+		return ""
+	}
+	return "; if the stored resume position is no longer available on the server, run with --full-refresh to rebuild the destination safely"
+}
+
+type psdbCDCTarget struct {
+	bareName   string              // table name as passed to the psdbconnect Sync RPC
+	resultName string              // RecordBatchResult.TableName tag ("" for single-table)
+	schema     *schema.TableSchema // output schema including CDC metadata columns
+}
+
+// psdbShardCursor is the persisted position of one shard of one table.
+type psdbShardCursor struct {
+	Position    string `json:"p,omitempty"`
+	LastKnownPk []byte `json:"k,omitempty"` // proto-marshaled *query.QueryResult
+}
+
+// psdbCursorState is the per-table cursor persisted into _cdc_lsn. psdbconnect
+// streams one table per shard with an independent position, so resume requires a
+// position per shard rather than the single cumulative VGTID Vitess VStream uses.
+type psdbCursorState struct {
+	Shards map[string]psdbShardCursor `json:"s"`
+}
+
+func (st psdbCursorState) startCursor(keyspace, shard string) (*psdbconnect.TableCursor, error) {
+	cur := &psdbconnect.TableCursor{Keyspace: keyspace, Shard: shard}
+	sc, ok := st.Shards[shard]
+	if !ok {
+		return cur, nil
+	}
+	cur.Position = sc.Position
+	if len(sc.LastKnownPk) > 0 {
+		pk := &querypb.QueryResult{}
+		if err := proto.Unmarshal(sc.LastKnownPk, pk); err != nil {
+			return nil, fmt.Errorf("invalid last_known_pk in resume cursor: %w", err)
+		}
+		cur.LastKnownPk = pk
+		// A pending snapshot resumes by primary key, not GTID.
+		cur.Position = ""
+	}
+	return cur, nil
+}
+
+func shardCursorFrom(c *psdbconnect.TableCursor) (psdbShardCursor, error) {
+	sc := psdbShardCursor{Position: c.GetPosition()}
+	if pk := c.GetLastKnownPk(); pk != nil {
+		raw, err := proto.Marshal(pk)
+		if err != nil {
+			return sc, fmt.Errorf("failed to encode last_known_pk: %w", err)
+		}
+		sc.LastKnownPk = raw
+	}
+	return sc, nil
+}
+
+func encodePsdbCursor(st psdbCursorState) (string, error) {
+	raw, err := json.Marshal(st)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode PlanetScale cursor: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+func decodePsdbCursor(payload string) (psdbCursorState, error) {
+	st := psdbCursorState{Shards: map[string]psdbShardCursor{}}
+	raw, err := base64.RawURLEncoding.DecodeString(payload)
+	if err != nil {
+		return st, fmt.Errorf("invalid cursor payload: %w", err)
+	}
+	if err := json.Unmarshal(raw, &st); err != nil {
+		return st, fmt.Errorf("invalid cursor payload: %w", err)
+	}
+	if st.Shards == nil {
+		st.Shards = map[string]psdbShardCursor{}
+	}
+	return st, nil
+}
+
+// runPsdbConnect streams every selected table across its shards via psdbconnect,
+// emitting CDC batches through the shared change buffers. Each table is captured
+// independently with its own per-shard cursor persisted in _cdc_lsn. Batch runs
+// stop each shard at an upfront boundary; streaming runs keep every selected
+// table/shard stream open concurrently.
+func (s *PlanetScaleCDCSource) runPsdbConnect(ctx context.Context, targets []psdbCDCTarget, resumeByTable map[string]string, opts source.ReadOptions, results chan<- source.RecordBatchResult) error {
+	if len(targets) == 0 {
+		return nil
+	}
+
+	shards, err := listVitessShards(ctx, s.db, s.keyspace)
+	if err != nil {
+		return err
+	}
+	if len(shards) == 0 {
+		return fmt.Errorf("no shards found for keyspace %s", s.keyspace)
+	}
+	config.Debug("[SOURCE] PlanetScale CDC: keyspace=%q shards=%v tables=%d", s.keyspace, shards, len(targets))
+
+	client, err := psdbconnect.Dial(s.host, s.username, s.password)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	if opts.Streaming {
+		return s.runPsdbConnectStreaming(ctx, client, targets, resumeByTable, shards, opts, results)
+	}
+
+	batchSize := mysqlCDCStreamBatchSize(opts)
+	buffers := make(map[string]*mysqlCDCChangeBuffer, len(targets))
+
+	for _, t := range targets {
+		if err := s.streamTable(ctx, client, t, resumeByTable[t.bareName], shards, batchSize, buffers, results); err != nil {
+			return err
+		}
+	}
+	return flushMySQLCDCChangeBuffers(buffers, results)
+}
+
+func (s *PlanetScaleCDCSource) streamTable(ctx context.Context, client *psdbconnect.Client, t psdbCDCTarget, resumeLSN string, shards []string, batchSize int, buffers map[string]*mysqlCDCChangeBuffer, results chan<- source.RecordBatchResult) error {
+	sourceCols := sourceColumnsWithoutMySQLCDC(t.schema)
+	pkPositions := psdbPKPositions(sourceCols, t.schema.PrimaryKeys)
+
+	state := psdbCursorState{Shards: map[string]psdbShardCursor{}}
+	var ordinal uint64
+	if resumeLSN != "" {
+		ord, payload, ok := parseVitessLSN(resumeLSN)
+		if !ok {
+			return fmt.Errorf("resume position %q for %s is invalid; run with --full-refresh to rebuild the destination safely", resumeLSN, t.bareName)
+		}
+		decoded, err := decodePsdbCursor(payload)
+		if err != nil {
+			return fmt.Errorf("resume position for %s is invalid: %w; run with --full-refresh to rebuild the destination safely", t.bareName, err)
+		}
+		state = decoded
+		ordinal = ord + 1
+	}
+
+	for _, shard := range shards {
+		start, err := state.startCursor(s.keyspace, shard)
+		if err != nil {
+			return err
+		}
+
+		stopPos, err := s.peekPosition(ctx, client, t.bareName, shard)
+		if err != nil {
+			return err
+		}
+		config.Debug("[SOURCE] PlanetScale CDC: %s shard=%q startPos=%q hasLastPk=%v stopPos=%q", t.bareName, shard, start.GetPosition(), start.GetLastKnownPk() != nil, stopPos)
+		// A resumed shard with no pending snapshot that has already reached the
+		// current position has nothing to stream; skip it (and avoid blocking on
+		// an idle stream that would never return).
+		if start.GetLastKnownPk() == nil && start.GetPosition() != "" && gtidAtLeast(start.GetPosition(), stopPos) {
+			config.Debug("[SOURCE] PlanetScale CDC: %s shard=%q already caught up; skipping", t.bareName, shard)
+			continue
+		}
+
+		if err := s.streamShard(ctx, client, t, shard, start, stopPos, sourceCols, pkPositions, &ordinal, &state, batchSize, buffers, results); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type psdbStreamingTableState struct {
+	target  psdbCDCTarget
+	state   psdbCursorState
+	ordinal uint64
+	buffers map[string]*mysqlCDCChangeBuffer
+	mu      sync.Mutex
+}
+
+func newPsdbStreamingTableState(target psdbCDCTarget, state psdbCursorState, ordinal uint64) *psdbStreamingTableState {
+	if state.Shards == nil {
+		state.Shards = map[string]psdbShardCursor{}
+	}
+	return &psdbStreamingTableState{
+		target:  target,
+		state:   state,
+		ordinal: ordinal,
+		buffers: make(map[string]*mysqlCDCChangeBuffer, 1),
+	}
+}
+
+func (st *psdbStreamingTableState) processResponse(ctx context.Context, shard string, cursor *psdbconnect.TableCursor, copyFinished bool, copyCheckpoint *mysqlCDCChange, changes []mysqlCDCChange, copyPhase bool, batchSize int, results chan<- source.RecordBatchResult) (*mysqlCDCChange, error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	if cursor != nil {
+		sc, err := shardCursorFrom(cursor)
+		if err != nil {
+			return nil, err
+		}
+		st.state.Shards[shard] = sc
+	}
+
+	if copyFinished && copyCheckpoint != nil {
+		payload, err := encodePsdbCursor(st.state)
+		if err != nil {
+			return nil, err
+		}
+		checkpoint := *copyCheckpoint
+		checkpoint.lsn = formatVitessLSN(st.ordinal, 0, payload)
+		if err := appendMySQLCDCBufferedChangesWithTokenContext(ctx, st.buffers, st.target.bareName, st.target.schema, st.target.resultName, []mysqlCDCChange{checkpoint}, batchSize, results, nil); err != nil {
+			return nil, err
+		}
+		st.ordinal++
+	}
+
+	if len(changes) == 0 {
+		return nil, nil
+	}
+
+	payload, err := encodePsdbCursor(st.state)
+	if err != nil {
+		return nil, err
+	}
+	for i := range changes {
+		changes[i].lsn = formatVitessLSN(st.ordinal, i, payload)
+	}
+	var checkpoint *mysqlCDCChange
+	if copyPhase {
+		cp := changes[len(changes)-1]
+		checkpoint = &cp
+	}
+	if err := appendMySQLCDCBufferedChangesWithTokenContext(ctx, st.buffers, st.target.bareName, st.target.schema, st.target.resultName, changes, batchSize, results, nil); err != nil {
+		return nil, err
+	}
+	st.ordinal++
+	return checkpoint, nil
+}
+
+func (st *psdbStreamingTableState) flush(ctx context.Context, results chan<- source.RecordBatchResult) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return flushMySQLCDCChangeBuffersWithTokenContext(ctx, st.buffers, results, nil)
+}
+
+func (s *PlanetScaleCDCSource) runPsdbConnectStreaming(ctx context.Context, client *psdbconnect.Client, targets []psdbCDCTarget, resumeByTable map[string]string, shards []string, opts source.ReadOptions, results chan<- source.RecordBatchResult) error {
+	batchSize := mysqlCDCStreamBatchSize(opts)
+	tables := make([]*psdbStreamingTableState, 0, len(targets))
+	eg, streamCtx := errgroup.WithContext(ctx)
+
+	for _, target := range targets {
+		state := psdbCursorState{Shards: map[string]psdbShardCursor{}}
+		var ordinal uint64
+		if resumeLSN := strings.TrimSpace(resumeByTable[target.bareName]); resumeLSN != "" {
+			ord, payload, ok := parseVitessLSN(resumeLSN)
+			if !ok {
+				return fmt.Errorf("resume position %q for %s is invalid; run with --full-refresh to rebuild the destination safely", resumeLSN, target.bareName)
+			}
+			decoded, err := decodePsdbCursor(payload)
+			if err != nil {
+				return fmt.Errorf("resume position for %s is invalid: %w; run with --full-refresh to rebuild the destination safely", target.bareName, err)
+			}
+			state = decoded
+			ordinal = ord + 1
+		}
+
+		tableState := newPsdbStreamingTableState(target, state, ordinal)
+		tables = append(tables, tableState)
+		sourceCols := sourceColumnsWithoutMySQLCDC(target.schema)
+		pkPositions := psdbPKPositions(sourceCols, target.schema.PrimaryKeys)
+		for _, shard := range shards {
+			start, err := tableState.state.startCursor(s.keyspace, shard)
+			if err != nil {
+				return err
+			}
+			shardName := shard
+			startCursor := start
+			eg.Go(func() error {
+				return s.streamShardContinuous(streamCtx, client, tableState, shardName, startCursor, sourceCols, pkPositions, batchSize, results)
+			})
+		}
+	}
+
+	eg.Go(func() error {
+		ticker := time.NewTicker(mysqlCDCStreamingFlushInterval(opts))
+		defer ticker.Stop()
+		for {
+			select {
+			case <-streamCtx.Done():
+				return nil
+			case <-ticker.C:
+				if err := flushPsdbStreamingTables(streamCtx, tables, results); err != nil {
+					return err
+				}
+			}
+		}
+	})
+
+	err := eg.Wait()
+	if ctx.Err() != nil {
+		drainCtx, cancel := detachedMySQLCDCStreamDrainContext(ctx)
+		defer cancel()
+		if flushErr := flushPsdbStreamingTables(drainCtx, tables, results); flushErr != nil {
+			return flushErr
+		}
+		return ctx.Err()
+	}
+	return err
+}
+
+func flushPsdbStreamingTables(ctx context.Context, tables []*psdbStreamingTableState, results chan<- source.RecordBatchResult) error {
+	for _, table := range tables {
+		if err := table.flush(ctx, results); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *PlanetScaleCDCSource) streamShardContinuous(ctx context.Context, client *psdbconnect.Client, table *psdbStreamingTableState, shard string, start *psdbconnect.TableCursor, sourceCols []schema.Column, pkPositions []int, batchSize int, results chan<- source.RecordBatchResult) error {
+	sctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	stream, err := client.Sync(sctx, &psdbconnect.SyncRequest{
+		TableName:      table.target.bareName,
+		Cursor:         start,
+		TabletType:     psdbconnect.TabletType_primary,
+		IncludeInserts: true,
+		IncludeUpdates: true,
+		IncludeDeletes: true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to start psdbconnect Sync for %s/%s: %w%s", table.target.bareName, shard, err, psdbResumeHint(start))
+	}
+
+	type recvResult struct {
+		resp *psdbconnect.SyncResponse
+		err  error
+	}
+	recvCh := make(chan recvResult)
+	go func() {
+		for {
+			resp, err := stream.Recv()
+			select {
+			case recvCh <- recvResult{resp: resp, err: err}:
+			case <-sctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	stall := time.NewTimer(psdbRecvStallTimeout)
+	defer stall.Stop()
+
+	cursor := start
+	copyDone := start.GetPosition() != "" && start.GetLastKnownPk() == nil
+	sawLastPk := start.GetLastKnownPk() != nil
+	anchor := ""
+	var copyCheckpoint *mysqlCDCChange
+	for {
+		var resp *psdbconnect.SyncResponse
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-stall.C:
+			return fmt.Errorf("psdbconnect Sync for %s/%s made no progress for %v (position %q, copy done: %v); the shard may be idle without heartbeat writes to advance its GTID — retry, or run with --full-refresh to rebuild the destination safely", table.target.bareName, shard, psdbRecvStallTimeout, cursor.GetPosition(), copyDone)
+		case rr := <-recvCh:
+			if rr.err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				if errors.Is(rr.err, io.EOF) {
+					return fmt.Errorf("psdbconnect Sync ended unexpectedly for %s/%s", table.target.bareName, shard)
+				}
+				return fmt.Errorf("psdbconnect Sync receive failed for %s/%s: %w%s", table.target.bareName, shard, rr.err, psdbResumeHint(start))
+			}
+			resp = rr.resp
+		}
+		if !stall.Stop() {
+			select {
+			case <-stall.C:
+			default:
+			}
+		}
+		stall.Reset(psdbRecvStallTimeout)
+		if rpcErr := resp.GetError(); rpcErr != nil && rpcErr.GetCode() != vtrpcpb.Code_OK {
+			return fmt.Errorf("psdbconnect Sync error for %s/%s: %s", table.target.bareName, shard, rpcErr.GetMessage())
+		}
+
+		changes, err := decodePsdbChanges(resp, sourceCols, pkPositions)
+		if err != nil {
+			return err
+		}
+
+		respCursor := resp.GetCursor()
+		if respCursor != nil {
+			cursor = respCursor
+		}
+		pos := cursor.GetPosition()
+		hasLastPk := cursor.GetLastKnownPk() != nil
+		if hasLastPk {
+			sawLastPk = true
+		}
+		if anchor == "" && pos != "" {
+			anchor = pos
+		}
+
+		if len(changes) > 0 || hasLastPk {
+			config.Debug("[SOURCE] PlanetScale CDC stream: %s/%s resp result=%d updates=%d deletes=%d changes=%d pos=%q hasLastPk=%v copyDone=%v",
+				table.target.bareName, shard, len(resp.GetResult()), len(resp.GetUpdates()), len(resp.GetDeletes()), len(changes), pos, hasLastPk, copyDone)
+		}
+
+		copyFinished := false
+		if !copyDone && psdbCopyFinished(sawLastPk, pos, anchor, hasLastPk) {
+			copyDone = true
+			copyFinished = true
+		}
+
+		copyPhase := !copyDone && hasLastPk
+		checkpoint, err := table.processResponse(ctx, shard, respCursor, copyFinished, copyCheckpoint, changes, copyPhase, batchSize, results)
+		if err != nil {
+			return err
+		}
+		if copyFinished {
+			copyCheckpoint = nil
+		}
+		if copyPhase && checkpoint != nil {
+			copyCheckpoint = checkpoint
+		}
+	}
+}
+
+func (s *PlanetScaleCDCSource) streamShard(ctx context.Context, client *psdbconnect.Client, t psdbCDCTarget, shard string, start *psdbconnect.TableCursor, stopPos string, sourceCols []schema.Column, pkPositions []int, ordinal *uint64, state *psdbCursorState, batchSize int, buffers map[string]*mysqlCDCChangeBuffer, results chan<- source.RecordBatchResult) error {
+	sctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	stream, err := client.Sync(sctx, &psdbconnect.SyncRequest{
+		TableName:      t.bareName,
+		Cursor:         start,
+		TabletType:     psdbconnect.TabletType_primary,
+		IncludeInserts: true,
+		IncludeUpdates: true,
+		IncludeDeletes: true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to start psdbconnect Sync for %s/%s: %w%s", t.bareName, shard, err, psdbResumeHint(start))
+	}
+
+	// Recv runs in its own goroutine so the loop can bound how long it waits: the
+	// server never half-closes an idle stream, so a shard whose GTID stops
+	// advancing (e.g. no heartbeat writes on a non-PlanetScale psdbconnect
+	// endpoint) would otherwise block Recv forever. Canceling sctx unblocks and
+	// ends the reader goroutine.
+	type recvResult struct {
+		resp *psdbconnect.SyncResponse
+		err  error
+	}
+	recvCh := make(chan recvResult)
+	go func() {
+		for {
+			resp, err := stream.Recv()
+			select {
+			case recvCh <- recvResult{resp: resp, err: err}:
+			case <-sctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	stall := time.NewTimer(psdbRecvStallTimeout)
+	defer stall.Stop()
+
+	cursor := start
+	// A fresh stream (empty position) or a resumed pending snapshot must run the
+	// copy phase before the loop may stop; an incremental resume has no copy.
+	copyDone := start.GetPosition() != "" && start.GetLastKnownPk() == nil
+	sawLastPk := start.GetLastKnownPk() != nil
+	anchor := ""
+	pendingCopyStart := -1
+	var copyCheckpoint *mysqlCDCChange
+	for {
+		var resp *psdbconnect.SyncResponse
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-stall.C:
+			return fmt.Errorf("psdbconnect Sync for %s/%s made no progress for %v (position %q, stop %q, copy done: %v); the shard may be idle without heartbeat writes to advance its GTID — retry, or run with --full-refresh to rebuild the destination safely", t.bareName, shard, psdbRecvStallTimeout, cursor.GetPosition(), stopPos, copyDone)
+		case rr := <-recvCh:
+			if rr.err != nil {
+				if errors.Is(rr.err, io.EOF) {
+					config.Debug("[SOURCE] PlanetScale CDC: %s/%s stream EOF", t.bareName, shard)
+					return nil
+				}
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return fmt.Errorf("psdbconnect Sync receive failed for %s/%s: %w%s", t.bareName, shard, rr.err, psdbResumeHint(start))
+			}
+			resp = rr.resp
+		}
+		if !stall.Stop() {
+			select {
+			case <-stall.C:
+			default:
+			}
+		}
+		stall.Reset(psdbRecvStallTimeout)
+		if rpcErr := resp.GetError(); rpcErr != nil && rpcErr.GetCode() != vtrpcpb.Code_OK {
+			return fmt.Errorf("psdbconnect Sync error for %s/%s: %s", t.bareName, shard, rpcErr.GetMessage())
+		}
+
+		changes, err := decodePsdbChanges(resp, sourceCols, pkPositions)
+		if err != nil {
+			return err
+		}
+
+		if c := resp.GetCursor(); c != nil {
+			cursor = c
+			sc, err := shardCursorFrom(c)
+			if err != nil {
+				return err
+			}
+			state.Shards[shard] = sc
+		}
+		pos := cursor.GetPosition()
+		hasLastPk := cursor.GetLastKnownPk() != nil
+		if hasLastPk {
+			sawLastPk = true
+		}
+		if anchor == "" && pos != "" {
+			anchor = pos
+		}
+
+		// Log only on real activity (changes or copy-phase rows); heartbeat-only
+		// responses advance the GTID constantly and would otherwise flood --debug.
+		if len(changes) > 0 || hasLastPk {
+			config.Debug("[SOURCE] PlanetScale CDC: %s/%s resp result=%d updates=%d deletes=%d changes=%d pos=%q hasLastPk=%v copyDone=%v",
+				t.bareName, shard, len(resp.GetResult()), len(resp.GetUpdates()), len(resp.GetDeletes()), len(changes), pos, hasLastPk, copyDone)
+		}
+
+		// The snapshot is finished once the per-row primary-key checkpoint clears
+		// after appearing, or (for an empty table) the position advances past the
+		// snapshot's anchor.
+		if !copyDone && psdbCopyFinished(sawLastPk, pos, anchor, hasLastPk) {
+			copyDone = true
+			payload, err := encodePsdbCursor(*state)
+			if err != nil {
+				return err
+			}
+			if psdbRewriteBufferedLSNs(buffers, t.bareName, pendingCopyStart, *ordinal, payload) {
+				(*ordinal)++
+			} else if copyCheckpoint != nil {
+				checkpoint := *copyCheckpoint
+				checkpoint.lsn = formatVitessLSN(*ordinal, 0, payload)
+				if err := appendMySQLCDCBufferedChanges(buffers, t.bareName, t.schema, t.resultName, []mysqlCDCChange{checkpoint}, batchSize, results); err != nil {
+					return err
+				}
+				(*ordinal)++
+			}
+			pendingCopyStart = -1
+			copyCheckpoint = nil
+		}
+
+		if len(changes) > 0 {
+			payload, err := encodePsdbCursor(*state)
+			if err != nil {
+				return err
+			}
+			for i := range changes {
+				changes[i].lsn = formatVitessLSN(*ordinal, i, payload)
+			}
+			copyPhase := !copyDone && hasLastPk
+			beforeLen := 0
+			if copyPhase {
+				if buffer := buffers[t.bareName]; buffer != nil {
+					beforeLen = len(buffer.changes)
+				}
+				checkpoint := changes[len(changes)-1]
+				copyCheckpoint = &checkpoint
+			}
+			if err := appendMySQLCDCBufferedChanges(buffers, t.bareName, t.schema, t.resultName, changes, batchSize, results); err != nil {
+				return err
+			}
+			if copyPhase {
+				if buffer := buffers[t.bareName]; buffer != nil && len(buffer.changes) >= beforeLen+len(changes) {
+					if pendingCopyStart < 0 {
+						pendingCopyStart = beforeLen
+					}
+				} else {
+					pendingCopyStart = -1
+				}
+			}
+			(*ordinal)++
+		}
+
+		// In batch mode, stop once the snapshot is done and the stream has caught
+		// up to the position observed when it started (at or beyond stopPos). The
+		// current response's changes have already been emitted above, so returning
+		// here is safe even when this very response carried the shard's final
+		// change and landed on stopPos — see psdbReachedStop for why we must not
+		// wait for a separate empty response.
+		if psdbReachedStop(copyDone, hasLastPk, pos, stopPos) {
+			config.Debug("[SOURCE] PlanetScale CDC: %s/%s stop: caught up (pos=%q >= stop=%q)", t.bareName, shard, pos, stopPos)
+			return nil
+		}
+	}
+}
+
+func psdbCopyFinished(sawLastPk bool, pos, anchor string, hasLastPk bool) bool {
+	return !hasLastPk && (sawLastPk || (pos != "" && anchor != "" && pos != anchor))
+}
+
+// psdbReachedStop reports whether a batch-mode shard stream has captured
+// everything up to the boundary observed when it started (stopPos) and may
+// return. It deliberately does NOT require a change-free response: the response
+// carrying a shard's final change usually lands exactly on stopPos, and on an
+// otherwise-idle shard no further heartbeat response ever arrives — waiting for
+// one would block Recv forever (and, since shards stream sequentially, stall
+// every later shard). Callers emit the current response's changes before
+// checking this, so stopping here loses nothing.
+func psdbReachedStop(copyDone, hasLastPk bool, pos, stopPos string) bool {
+	return copyDone && !hasLastPk && gtidAtLeast(pos, stopPos)
+}
+
+func psdbRewriteBufferedLSNs(buffers map[string]*mysqlCDCChangeBuffer, key string, start int, ordinal uint64, payload string) bool {
+	if start < 0 {
+		return false
+	}
+	buffer := buffers[key]
+	if buffer == nil || start >= len(buffer.changes) {
+		return false
+	}
+	for i := start; i < len(buffer.changes); i++ {
+		buffer.changes[i].lsn = formatVitessLSN(ordinal, i-start, payload)
+	}
+	return true
+}
+
+// peekPosition opens a short-lived Sync at the special "current" position to read
+// the shard's latest VGTID, used as the stop boundary for batch capture.
+func (s *PlanetScaleCDCSource) peekPosition(ctx context.Context, client *psdbconnect.Client, table, shard string) (string, error) {
+	pctx, cancel := context.WithTimeout(ctx, psdbPeekTimeout)
+	defer cancel()
+
+	stream, err := client.Sync(pctx, &psdbconnect.SyncRequest{
+		TableName:  table,
+		Cursor:     &psdbconnect.TableCursor{Keyspace: s.keyspace, Shard: shard, Position: "current"},
+		TabletType: psdbconnect.TabletType_primary,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to peek psdbconnect position for %s/%s: %w", table, shard, err)
+	}
+	resp, err := stream.Recv()
+	if err != nil {
+		return "", fmt.Errorf("failed to read psdbconnect peek for %s/%s: %w", table, shard, err)
+	}
+	if c := resp.GetCursor(); c != nil {
+		return c.GetPosition(), nil
+	}
+	return "", fmt.Errorf("psdbconnect peek for %s/%s returned no cursor", table, shard)
+}
+
+// decodePsdbChanges turns a SyncResponse into ordered CDC changes. Inserts and
+// the after-image of updates become upserts; deletes (which carry only primary
+// keys) and the before-image of a primary-key-changing update become tombstones.
+func decodePsdbChanges(resp *psdbconnect.SyncResponse, sourceCols []schema.Column, pkPositions []int) ([]mysqlCDCChange, error) {
+	var changes []mysqlCDCChange
+
+	for _, qr := range resp.GetResult() {
+		rows, err := psdbResultRows(qr, sourceCols)
+		if err != nil {
+			return nil, err
+		}
+		for _, vals := range rows {
+			changes = append(changes, mysqlCDCChange{values: vals, deleted: false})
+		}
+	}
+
+	for _, up := range resp.GetUpdates() {
+		beforeRows, err := psdbResultRows(up.GetBefore(), sourceCols)
+		if err != nil {
+			return nil, err
+		}
+		afterRows, err := psdbResultRows(up.GetAfter(), sourceCols)
+		if err != nil {
+			return nil, err
+		}
+		for i, after := range afterRows {
+			if i < len(beforeRows) && psdbPKChanged(beforeRows[i], after, pkPositions) {
+				changes = append(changes, mysqlCDCChange{values: beforeRows[i], deleted: true})
+			}
+			changes = append(changes, mysqlCDCChange{values: after, deleted: false})
+		}
+	}
+
+	for _, del := range resp.GetDeletes() {
+		rows, err := psdbResultRows(del.GetResult(), sourceCols)
+		if err != nil {
+			return nil, err
+		}
+		for _, vals := range rows {
+			changes = append(changes, mysqlCDCChange{values: vals, deleted: true})
+		}
+	}
+
+	return changes, nil
+}
+
+// psdbResultRows decodes a query.QueryResult into source-column-ordered values.
+// Columns absent from the result (e.g. non-PK columns of a delete tombstone)
+// become nil, which the merge strategy resolves by primary key.
+func psdbResultRows(qr *querypb.QueryResult, sourceCols []schema.Column) ([][]interface{}, error) {
+	if qr == nil || len(qr.Rows) == 0 {
+		return nil, nil
+	}
+	idxByName := make(map[string]int, len(qr.Fields))
+	for i, f := range qr.Fields {
+		idxByName[strings.ToLower(f.Name)] = i
+	}
+	out := make([][]interface{}, 0, len(qr.Rows))
+	for _, row := range qr.Rows {
+		vals := sqltypes.MakeRowTrusted(qr.Fields, row)
+		decoded := make([]interface{}, len(sourceCols))
+		for i, col := range sourceCols {
+			idx, ok := idxByName[strings.ToLower(col.Name)]
+			if !ok || idx < 0 || idx >= len(vals) {
+				decoded[i] = nil
+				continue
+			}
+			v := vals[idx]
+			if v.IsNull() {
+				decoded[i] = nil
+				continue
+			}
+			if col.DataType == schema.TypeBinary {
+				raw := v.Raw()
+				cp := make([]byte, len(raw))
+				copy(cp, raw)
+				decoded[i] = cp
+				continue
+			}
+			decoded[i] = v.ToString()
+		}
+		out = append(out, decoded)
+	}
+	return out, nil
+}
+
+func psdbPKPositions(sourceCols []schema.Column, primaryKeys []string) []int {
+	out := make([]int, 0, len(primaryKeys))
+	for _, pk := range primaryKeys {
+		for i, col := range sourceCols {
+			if strings.EqualFold(col.Name, pk) {
+				out = append(out, i)
+				break
+			}
+		}
+	}
+	return out
+}
+
+func psdbPKChanged(before, after []interface{}, pkPositions []int) bool {
+	for _, idx := range pkPositions {
+		if idx < 0 || idx >= len(before) || idx >= len(after) {
+			continue
+		}
+		if !reflect.DeepEqual(before[idx], after[idx]) {
+			return true
+		}
+	}
+	return false
+}
+
+var (
+	_ source.Source           = (*PlanetScaleCDCSource)(nil)
+	_ source.StreamingSource  = (*PlanetScaleCDCSource)(nil)
+	_ source.MultiTableSource = (*PlanetScaleCDCSource)(nil)
+	_ source.TableSelector    = (*PlanetScaleCDCSource)(nil)
+	_ source.SourceTable      = (*PlanetScaleCDCTable)(nil)
+)

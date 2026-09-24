@@ -1,0 +1,192 @@
+# LinkedIn Ads
+LinkedIn Ads is a platform that allows businesses and marketers to create, manage, and analyze advertising campaigns.
+
+Ingestr supports LinkedIn Ads as a source.
+
+## URI format
+The URI format for LinkedIn Ads as a source is as follows:
+
+```plaintext
+linkedinads://?access_token=<access_token>&account_ids=<account_ids>
+```
+## URI parameters:
+- `access_token`(required): It is used for authentication and is necessary to access data and reports through the LinkedIn Ads API. The access token lets your app access data using the permissions you set in the Developer App for your LinkedIn account.
+- `account_ids`(required): The comma-separated list of Ad Account IDs specifies the LinkedIn Ad Accounts for which you want to retrieve data. These IDs uniquely identify the LinkedIn Ad Accounts associated with a company, business, or individual, depending on the ownership of the Ad Accounts. They are required to fetch data for campaigns, creatives, and other related resources.
+
+LinkedIn Ads requires an `access_token` and `account_ids` to retrieve reports from the [LinkedIn Ads API](https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting?view=li-lms-2024-11&tabs=http#analytics-finder). Please follow these steps to obtain the `access_token` and `account_ids`
+
+### Create a LinkedIn developer application to obtain an access token
+1. Log in to LinkedIn with a [developer account](https://www.linkedin.com/developers)
+2. Click Create App. Please fill out:
+    - App Name
+    - Your company's LinkedIn page
+    - Your company's privacy policy URL
+    - Your company logo
+- Accept the terms and click "Create App"
+3. To verify your app:
+   - Go to "Settings" tab
+   - Find "App Settings"
+   - Click "Verify" under Company
+   - Click "Generate URL"
+   - Send this URL to your Page Admin 
+   - Click "I'm done" and open the URL in a new tab to verify, if you are the admin of your page.
+   -  Go to the "Products" tab, and click "Request access" for the Advertising API. It will take about a few minutes to get approved and then you need to fill out the form where you have to provide your company name, website, and other details.
+
+#### Authorize your app and obtain access token
+1. Go to the "Auth" tab
+4. Click "OAuth 2.0 tools" which is on top right corner of the page [link](https://www.linkedin.com/developers/tools/oauth)
+5. Click "Create token"
+6. Choose these permissions:
+   - `r_ads`
+   - `r_ads_reporting`
+7. Click "Request access token"
+8. You will be redirected to an authorization page. Use your LinkedIn credentials to log in and authorize your app and obtain your Access Token and Refresh Token. Copy the Access Token.
+
+> [!NOTE]
+> Access tokens last for 2 months. After they expire, you'll need to make new ones using 
+> [LinkedIn's Token Generator](https://www.linkedin.com/developers/tools/oauth/token-generator).
+
+To find the Ad Account IDs, the ad account owner can refer to the detailed instructions provided in this [guide](https://www.linkedin.com/help/linkedin/answer/a424270/find-linkedin-ads-account-details?lang=en).
+
+## Tables
+
+LinkedIn Ads source allows ingesting the following sources into separate tables:
+
+| Table | PK | Inc Key | Inc Strategy | Details |
+| ----- | -- | ------- | ------------ | ------- |
+| [ad_accounts](https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads/account-structure/create-and-manage-accounts?view=li-lms-2024-11&tabs=http) | id | – | replace | Retrieves all ad accounts accessible by the authenticated user. |
+| [ad_account_users](https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads/account-structure/create-and-manage-account-users?view=li-lms-2024-11&tabs=http) | user, account | – | replace | Retrieves users associated with each ad account. |
+| [campaign_groups](https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads/account-structure/create-and-manage-campaign-groups?view=li-lms-2024-11&tabs=http) | id | – | replace | Retrieves campaign groups for each ad account. |
+| [campaigns](https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads/account-structure/create-and-manage-campaigns?view=li-lms-2024-11&tabs=http) | id | – | replace | Retrieves campaigns for each ad account. |
+| [creatives](https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads/account-structure/create-and-manage-creatives?view=li-lms-2024-11&tabs=http) | id | – | replace | Retrieves creatives for each ad account. |
+| [conversions](https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/conversion-tracking?view=li-lms-2024-11&tabs=http) | id | – | replace | Retrieves conversion rules for each ad account. |
+| [lead_forms](https://learn.microsoft.com/en-us/linkedin/marketing/lead-sync/leadsync?view=li-lms-2025-11&viewFallbackFrom=li-lms-2024-06&tabs=http#lead-forms-1) | id | – | replace | Retrieves lead generation forms for each ad account. |
+| [lead_form_responses](https://learn.microsoft.com/en-us/linkedin/marketing/lead-sync/leadsync?view=li-lms-2025-11&viewFallbackFrom=li-lms-2024-06&tabs=http#get-lead-form-responses) | id | date (interval)| merge | Retrieves lead form responses for each ad account. |
+| dmp_segments | id | – | replace | Retrieves matched/retargeting audience segments (sizes, match rates, rules) for each ad account. |
+| insight_tags | id | – | replace | Retrieves Insight Tag configuration and installation status for each ad account. |
+| insight_tag_domains | domainName, account_id | – | replace | Retrieves domains associated with Insight Tags for each ad account. |
+| [custom](https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting?view=li-lms-2024-11&tabs=http#analytics-finder) | [dimension, date] or [dimension, start_date, end_date] | date (daily) or start_date (monthly) | merge | Custom reports allow you to retrieve data based on specific dimensions and metrics. |
+
+Use these as `--source-table` parameter in the `ingestr ingest` command.
+
+### Example
+
+Retrieve all campaigns:
+```sh
+ingestr ingest \
+    --source-uri "linkedinads://?access_token=token_123&account_ids=id_123,id_456" \
+    --source-table 'campaigns' \
+    --dest-uri 'duckdb:///linkedin.duckdb' \
+    --dest-table 'dest.campaigns'
+```
+
+Retrieve lead form responses for a specific date interval:
+```sh
+ingestr ingest \
+    --source-uri "linkedinads://?access_token=token_123" \
+    --source-table 'lead_form_responses' \
+    --dest-uri 'duckdb:///linkedin.duckdb' \
+    --dest-table 'dest.lead_form_responses' \
+    --interval-start '2024-01-01' \
+    --interval-end '2024-02-01'
+```
+If you omit `--interval-end`, ingestr fetches responses from `--interval-start` up to the current time.
+
+### Custom Reports
+
+The `custom` table uses LinkedIn's [Analytics Finder API](https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting?view=li-lms-2024-11&tabs=http#analytics-finder) to pull advertising performance reports. This allows you to retrieve metrics like impressions, clicks, and conversions broken down by dimensions such as campaign, account, or creative.
+
+**Format:**
+```
+custom:<dimensions>:<metrics>
+```
+
+**Parameters:**
+- `dimensions`(required): A comma-separated list of dimensions is required. It must include one pivot dimension and one time-based dimension (`date` or `month`).
+  - Pivot dimensions (pick one):
+    - Entity: `campaign`, `creative`, `account`
+    - Placement & device: `impression_device`
+    - Demographic: `member_job_title`, `member_job_function`, `member_seniority`, `member_industry`, `member_company_size`, `member_company`, `member_country`, `member_region`
+  - Time dimensions:
+    - `date`: group the data in your report by day
+    - `month`: group the data in your report by month
+- `metrics`(required): A comma-separated list of [metrics](https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting?view=li-lms-2024-11&tabs=http#metrics-available) to retrieve.
+
+> [!NOTE]
+> By default, ingestr fetches data from January 1, 2018 to today's date. You can specify a custom date range using the `--interval-start` and `--interval-end` parameters.
+
+### Custom Reports Examples
+
+Retrieve data for campaign with `account_ids` id_123 and id_456:
+```sh
+ingestr ingest \                      
+    --source-uri "linkedinads://?access_token=token_123&account_ids=id_123,id_456" \
+    --source-table 'custom:campaign,date:impressions,clicks' \
+    --dest-uri 'duckdb:///linkedin.duckdb' \
+    --dest-table 'dest.campaign'
+```
+
+The applied parameters for the report are:
+- dimensions: `campaign`, `date`
+- metrics: `impressions`, `clicks`
+
+Retrieve data for creative with `account_ids` id_123 and id_456 for the date range from 2024-10-15 to 2024-12-31:
+```sh
+ingestr ingest \                         
+    --source-uri "linkedinads://?access_token=token_123&account_ids=id_123,id_456" \
+    --source-table 'custom:creative,month:impressions,shares,videoCompletions' \
+    --dest-uri 'duckdb:///linkedin.duckdb' \
+    --dest-table 'dest.creative'
+    --interval-start '2024-10-15'
+    --interval-end '2024-12-31'
+```
+The applied parameters for the report are:
+- dimensions: `creative`, `month`
+- metrics: `shares`, `impressions`, `videoCompletions`
+
+```sh
+ingestr ingest \                         
+    --source-uri "linkedinads://?access_token=token_123&account_ids=id_123,id_456" \
+    --source-table 'custom:account,month:totalEngagements,impressions,' \
+    --dest-uri 'duckdb:///linkedin.duckdb' \
+    --dest-table 'dest.account'
+```
+The applied parameters for the report are:
+- dimensions: `account`, `month`
+- metrics: `totalEngagements`, `impressions`
+
+### Common Ad Analytics Reports
+
+The following common analytics breakdowns are all available through the `custom:` table:
+
+| Report | `--source-table` |
+| ------ | ---------------- |
+| Ad Analytics by Campaign | `custom:campaign,date:<metrics>` |
+| Ad Analytics by Creative | `custom:creative,date:<metrics>` |
+| Ad Analytics by Impression Device | `custom:impression_device,date:<metrics>` |
+| Ad Analytics by Member Company Size | `custom:member_company_size,date:<metrics>` |
+| Ad Analytics by Member Country | `custom:member_country,date:<metrics>` |
+| Ad Analytics by Member Job Function | `custom:member_job_function,date:<metrics>` |
+| Ad Analytics by Member Job Title | `custom:member_job_title,date:<metrics>` |
+| Ad Analytics by Member Industry | `custom:member_industry,date:<metrics>` |
+| Ad Analytics by Member Region | `custom:member_region,date:<metrics>` |
+| Ad Analytics by Member Company | `custom:member_company,date:<metrics>` |
+
+Replace `<metrics>` with the LinkedIn metrics you want (e.g. `impressions,clicks,costInLocalCurrency`). Swap `date` for `month` to switch from daily to monthly granularity.
+
+### Demographic Reports
+
+You can use demographic dimensions to audit targeting quality. For example, to retrieve impressions and clicks broken down by job title:
+```sh
+ingestr ingest \
+    --source-uri "linkedinads://?access_token=token_123&account_ids=id_123,id_456" \
+    --source-table 'custom:member_job_title,date:impressions,clicks' \
+    --dest-uri 'duckdb:///linkedin.duckdb' \
+    --dest-table 'dest.job_title_report'
+```
+
+Available demographic dimensions: `member_job_title`, `member_job_function`, `member_seniority`, `member_industry`, `member_company_size`, `member_company`, `member_country`, `member_region`.
+
+This command will retrieve data and save it to the destination table in the DuckDB database.
+
+<img alt="linkedin_ads_img" src="../media/linkedin_ads.png"/>

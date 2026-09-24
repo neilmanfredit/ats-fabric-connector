@@ -1,0 +1,119 @@
+version: 2
+project_name: ingestr
+before:
+  hooks:
+    - make generate
+builds:
+  - id: ingestr-darwin-amd64
+    binary: ingestr
+    ldflags:
+      - -s -w -X github.com/bruin-data/ingestr/cmd.Version={{ .Env.VERSION }} -X main.commit={{ .Env.COMMIT_SHA }}
+    main: ./
+    goarch:
+      - amd64
+    goos:
+      - darwin
+    env:
+      - CC=o64-clang
+      - CXX=o64-clang++
+      - CGO_ENABLED=1
+      - MACOSX_DEPLOYMENT_TARGET=10.15
+    flags:
+      - -trimpath
+
+  - id: ingestr-darwin-arm64
+    binary: ingestr
+    ldflags:
+      - -s -w -X github.com/bruin-data/ingestr/cmd.Version={{ .Env.VERSION }} -X main.commit={{ .Env.COMMIT_SHA }}
+    main: ./
+    goarch:
+      - arm64
+    goos:
+      - darwin
+    env:
+      - CC=o64-clang
+      - CXX=o64-clang++
+      - CGO_ENABLED=1
+      - MACOSX_DEPLOYMENT_TARGET=10.15
+    flags:
+      - -trimpath
+ 
+  - id: ingestr-linux-amd64
+    binary: ingestr
+    main: ./
+    env:
+      - CC=x86_64-linux-gnu-gcc
+      - CXX=x86_64-linux-gnu-g++
+      - CGO_ENABLED=1
+    goarch:
+      - amd64
+    goos:
+      - linux
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X github.com/bruin-data/ingestr/cmd.Version={{ .Env.VERSION }} -X main.commit={{ .Env.COMMIT_SHA }}
+  - id: ingestr-linux-arm64
+    binary: ingestr
+    main: ./
+    goarch:
+      - arm64
+    goos:
+      - linux
+    env:
+      - CC=aarch64-linux-gnu-gcc
+      - CXX=aarch64-linux-gnu-g++
+      - CGO_ENABLED=1
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X github.com/bruin-data/ingestr/cmd.Version={{ .Env.VERSION }} -X main.commit={{ .Env.COMMIT_SHA }}
+  - id: ingestr-windows-amd64
+    binary: ingestr
+    main: ./
+    goarch:
+      - amd64
+    goos:
+      - windows
+    env:
+      - CC=x86_64-w64-mingw32-gcc
+      - CXX=x86_64-w64-mingw32-g++
+      - CGO_ENABLED=1
+      - CGO_LDFLAGS=-static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lwinpthread -Wl,-Bdynamic
+    ldflags:
+      - -s -w -X github.com/bruin-data/ingestr/cmd.Version={{ .Env.VERSION }} -X main.commit={{ .Env.COMMIT_SHA }} -extldflags=-static
+    flags:
+      - -trimpath
+      - -buildmode=exe
+
+release:
+  # Publication is owned by release.yml after all five archives are tested.
+  draft: true
+  make_latest: false
+  prerelease: false
+
+archives:
+  - format: tar.gz
+    builds:
+      - "ingestr-linux-arm64"
+      - "ingestr-linux-amd64"
+      - "ingestr-darwin-amd64"
+      - "ingestr-darwin-arm64"
+      - "ingestr-windows-amd64"
+    name_template: >-
+      ingestr_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+    # use zip for windows archives
+    format_overrides:
+      - goos: windows
+        format: zip
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"

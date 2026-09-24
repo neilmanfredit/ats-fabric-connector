@@ -1,0 +1,511 @@
+package chess
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bruin-data/ingestr/internal/output"
+	"github.com/bruin-data/ingestr/pkg/arrowconv"
+	httpclient "github.com/bruin-data/ingestr/pkg/http"
+	"github.com/bruin-data/ingestr/pkg/source"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// captureOutput redirects the output package to a buffer for the duration of fn
+// and returns whatever was written, restoring the previous writers afterwards.
+func captureOutput(t *testing.T, fn func()) string {
+	t.Helper()
+	prevOut, prevErr, prevMode := output.Current()
+	t.Cleanup(func() { output.Init(prevOut, prevErr, prevMode) })
+	var buf bytes.Buffer
+	output.Init(&buf, &buf, output.ModeText)
+	fn()
+	return buf.String()
+}
+
+func TestParsePlayersFromURI(t *testing.T) {
+	tests := []struct {
+		name     string
+		uri      string
+		expected []string
+		wantErr  bool
+	}{
+		{
+			name:     "with players parameter",
+			uri:      "chess://?players=hikaru,magnuscarlsen",
+			expected: []string{"hikaru", "magnuscarlsen"},
+		},
+		{
+			name:     "single player",
+			uri:      "chess://?players=hikaru",
+			expected: []string{"hikaru"},
+		},
+		{
+			name:     "empty URI uses defaults",
+			uri:      "chess://",
+			expected: []string{"hikaru", "magnuscarlsen", "gothamchess", "fabianocaruana"},
+		},
+		{
+			name:     "empty players uses defaults",
+			uri:      "chess://?players=",
+			expected: []string{"hikaru", "magnuscarlsen", "gothamchess", "fabianocaruana"},
+		},
+		{
+			name:     "with spaces",
+			uri:      "chess://?players=hikaru, magnuscarlsen , gothamchess",
+			expected: []string{"hikaru", "magnuscarlsen", "gothamchess"},
+		},
+		{
+			name:    "invalid URI",
+			uri:     "http://example.com",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parsePlayersFromURI(tt.uri)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, got)
+		})
+	}
+}
+
+func TestChessSource_Schemes(t *testing.T) {
+	s := NewChessSource()
+	assert.Equal(t, []string{"chess"}, s.Schemes())
+}
+
+func TestChessSource_GetTable(t *testing.T) {
+	s := NewChessSource()
+	err := s.Connect(context.Background(), "chess://?players=testuser")
+	require.NoError(t, err)
+
+	table, err := s.GetTable(context.Background(), source.TableRequest{Name: "profiles"})
+	require.NoError(t, err)
+	assert.NotNil(t, table)
+	assert.Equal(t, "profiles", table.Name())
+	assert.False(t, table.HasKnownSchema())
+}
+
+func TestChessSource_Connect(t *testing.T) {
+	s := NewChessSource()
+	err := s.Connect(context.Background(), "chess://?players=hikaru,magnus")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"hikaru", "magnus"}, s.players)
+}
+
+func TestChessSource_ReadProfiles(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/player/testuser" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"username":    "testuser",
+				"player_id":   12345,
+				"title":       "GM",
+				"status":      "premium",
+				"name":        "Test User",
+				"avatar":      "https://example.com/avatar.jpg",
+				"location":    "Test City",
+				"country":     "https://api.chess.com/pub/country/US",
+				"joined":      1234567890,
+				"last_online": 1234567899,
+				"followers":   1000,
+				"is_streamer": false,
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	s := NewChessSource()
+	err := s.Connect(context.Background(), "chess://?players=testuser")
+	require.NoError(t, err)
+	// Replace the client with one pointing to our test server
+	_ = s.client.Close()
+	s.client = httpclient.New(
+		httpclient.WithBaseURL(server.URL),
+		httpclient.WithDisableRetry(),
+	)
+	defer func() { _ = s.client.Close() }()
+
+	table, err := s.GetTable(context.Background(), source.TableRequest{Name: "profiles"})
+	require.NoError(t, err)
+
+	results, err := table.Read(context.Background(), source.ReadOptions{})
+	require.NoError(t, err)
+
+	var batches []source.RecordBatchResult
+	for result := range results {
+		batches = append(batches, result)
+	}
+
+	require.Len(t, batches, 1)
+	require.NoError(t, batches[0].Err)
+	require.NotNil(t, batches[0].Batch)
+
+	batch := batches[0].Batch
+	assert.Equal(t, int64(1), batch.NumRows())
+}
+
+func TestChessSource_ReadUnsupportedTable(t *testing.T) {
+	s := NewChessSource()
+	err := s.Connect(context.Background(), "chess://?players=testuser")
+	require.NoError(t, err)
+
+	_, err = s.GetTable(context.Background(), source.TableRequest{Name: "invalid"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported table")
+}
+
+func TestChessSource_DeprecationWarning(t *testing.T) {
+	t.Run("warns when players supplied in URI", func(t *testing.T) {
+		out := captureOutput(t, func() {
+			s := NewChessSource()
+			require.NoError(t, s.Connect(context.Background(), "chess://?players=hikaru"))
+		})
+		assert.Contains(t, out, "deprecated")
+		assert.Contains(t, out, "source-table")
+	})
+
+	t.Run("no warning without players in URI", func(t *testing.T) {
+		out := captureOutput(t, func() {
+			s := NewChessSource()
+			require.NoError(t, s.Connect(context.Background(), "chess://"))
+		})
+		assert.Empty(t, out)
+	})
+}
+
+func TestNormalizePlayers(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want []string
+	}{
+		{"single", "hikaru", []string{"hikaru"}},
+		{"multiple", "hikaru,magnuscarlsen", []string{"hikaru", "magnuscarlsen"}},
+		{"trims whitespace", "hikaru, magnuscarlsen , gothamchess", []string{"hikaru", "magnuscarlsen", "gothamchess"}},
+		{"drops empty entries", "hikaru,,magnuscarlsen,", []string{"hikaru", "magnuscarlsen"}},
+		{"all empty", " , ", nil},
+		{"empty string", "", nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, normalizePlayers(tt.raw))
+		})
+	}
+}
+
+func TestChessSource_GetTable_StripsInlinePlayers(t *testing.T) {
+	s := NewChessSource()
+	err := s.Connect(context.Background(), "chess://?players=testuser")
+	require.NoError(t, err)
+
+	table, err := s.GetTable(context.Background(), source.TableRequest{Name: "profiles:hikaru,magnuscarlsen"})
+	require.NoError(t, err)
+	// The inline players must not leak into the table name.
+	assert.Equal(t, "profiles", table.Name())
+}
+
+func TestChessSource_GetTable_UnsupportedTableWithInlinePlayers(t *testing.T) {
+	s := NewChessSource()
+	err := s.Connect(context.Background(), "chess://?players=testuser")
+	require.NoError(t, err)
+
+	_, err = s.GetTable(context.Background(), source.TableRequest{Name: "invalid:hikaru"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported table")
+}
+
+func TestChessSource_InlinePlayersOverrideURI(t *testing.T) {
+	var requested []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requested = append(requested, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"username": r.URL.Path})
+	}))
+	defer server.Close()
+
+	s := NewChessSource()
+	err := s.Connect(context.Background(), "chess://?players=uriplayer")
+	require.NoError(t, err)
+	_ = s.client.Close()
+	s.client = httpclient.New(
+		httpclient.WithBaseURL(server.URL),
+		httpclient.WithDisableRetry(),
+	)
+	defer func() { _ = s.client.Close() }()
+
+	table, err := s.GetTable(context.Background(), source.TableRequest{Name: "profiles:hikaru,magnuscarlsen"})
+	require.NoError(t, err)
+
+	results, err := table.Read(context.Background(), source.ReadOptions{})
+	require.NoError(t, err)
+	for range results {
+	}
+
+	assert.ElementsMatch(t, []string{"/player/hikaru", "/player/magnuscarlsen"}, requested)
+	assert.NotContains(t, requested, "/player/uriplayer")
+}
+
+func TestChessSource_FallsBackToURIPlayers(t *testing.T) {
+	var requested []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requested = append(requested, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"username": r.URL.Path})
+	}))
+	defer server.Close()
+
+	s := NewChessSource()
+	err := s.Connect(context.Background(), "chess://?players=uriplayer")
+	require.NoError(t, err)
+	_ = s.client.Close()
+	s.client = httpclient.New(
+		httpclient.WithBaseURL(server.URL),
+		httpclient.WithDisableRetry(),
+	)
+	defer func() { _ = s.client.Close() }()
+
+	table, err := s.GetTable(context.Background(), source.TableRequest{Name: "profiles"})
+	require.NoError(t, err)
+
+	results, err := table.Read(context.Background(), source.ReadOptions{})
+	require.NoError(t, err)
+	for range results {
+	}
+
+	assert.Equal(t, []string{"/player/uriplayer"}, requested)
+}
+
+func TestItemsToArrowRecordWithSchema(t *testing.T) {
+	items := []map[string]interface{}{
+		{
+			"string_field": "value1",
+			"int_field":    float64(42),
+			"bool_field":   true,
+		},
+		{
+			"string_field": "value2",
+			"int_field":    float64(43),
+			"bool_field":   false,
+		},
+	}
+
+	record, err := arrowconv.ItemsToArrowRecordWithSchema(items, nil, nil)
+	require.NoError(t, err)
+	require.NotNil(t, record)
+
+	assert.Equal(t, int64(2), record.NumRows())
+	assert.Equal(t, 3, int(record.NumCols()))
+}
+
+func TestItemsToArrowRecordWithSchema_WithExcludeColumns(t *testing.T) {
+	items := []map[string]interface{}{
+		{
+			"keep_field":    "value1",
+			"exclude_field": "should_not_appear",
+		},
+	}
+
+	record, err := arrowconv.ItemsToArrowRecordWithSchema(items, nil, []string{"exclude_field"})
+	require.NoError(t, err)
+	require.NotNil(t, record)
+
+	assert.Equal(t, 1, int(record.NumCols()))
+
+	hasExcluded := false
+	for i := 0; i < int(record.NumCols()); i++ {
+		if record.ColumnName(i) == "exclude_field" {
+			hasExcluded = true
+		}
+	}
+	assert.False(t, hasExcluded)
+}
+
+func TestItemsToArrowRecordWithSchema_EmptyItems(t *testing.T) {
+	record, err := arrowconv.ItemsToArrowRecordWithSchema([]map[string]interface{}{}, nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), record.NumRows())
+}
+
+func TestParseArchiveDate(t *testing.T) {
+	tests := []struct {
+		name      string
+		url       string
+		wantYear  int
+		wantMonth int
+		wantOk    bool
+	}{
+		{
+			name:      "valid archive URL",
+			url:       "https://api.chess.com/pub/player/hikaru/games/2024/01",
+			wantYear:  2024,
+			wantMonth: 1,
+			wantOk:    true,
+		},
+		{
+			name:      "valid archive URL December",
+			url:       "https://api.chess.com/pub/player/hikaru/games/2023/12",
+			wantYear:  2023,
+			wantMonth: 12,
+			wantOk:    true,
+		},
+		{
+			name:   "invalid URL",
+			url:    "https://api.chess.com/pub/player/hikaru",
+			wantOk: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			year, month, ok := parseArchiveDate(tt.url)
+			assert.Equal(t, tt.wantOk, ok)
+			if ok {
+				assert.Equal(t, tt.wantYear, year)
+				assert.Equal(t, tt.wantMonth, month)
+			}
+		})
+	}
+}
+
+func TestIsArchiveInInterval(t *testing.T) {
+	jan2024 := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	mar2024 := time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name          string
+		archiveURL    string
+		intervalStart interface{}
+		intervalEnd   interface{}
+		expected      bool
+	}{
+		{
+			name:          "no interval - include all",
+			archiveURL:    "https://api.chess.com/pub/player/hikaru/games/2024/02",
+			intervalStart: nil,
+			intervalEnd:   nil,
+			expected:      true,
+		},
+		{
+			name:          "within interval",
+			archiveURL:    "https://api.chess.com/pub/player/hikaru/games/2024/02",
+			intervalStart: &jan2024,
+			intervalEnd:   &mar2024,
+			expected:      true,
+		},
+		{
+			name:          "before interval start",
+			archiveURL:    "https://api.chess.com/pub/player/hikaru/games/2023/12",
+			intervalStart: &jan2024,
+			intervalEnd:   nil,
+			expected:      false,
+		},
+		{
+			name:          "after interval end",
+			archiveURL:    "https://api.chess.com/pub/player/hikaru/games/2024/05",
+			intervalStart: nil,
+			intervalEnd:   &mar2024,
+			expected:      false,
+		},
+		{
+			name:          "exactly at interval start month",
+			archiveURL:    "https://api.chess.com/pub/player/hikaru/games/2024/01",
+			intervalStart: &jan2024,
+			intervalEnd:   nil,
+			expected:      true,
+		},
+		{
+			name:          "exactly at interval end month",
+			archiveURL:    "https://api.chess.com/pub/player/hikaru/games/2024/03",
+			intervalStart: nil,
+			intervalEnd:   &mar2024,
+			expected:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isArchiveInInterval(tt.archiveURL, tt.intervalStart, tt.intervalEnd)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+// TestChessByteCap proves the MaxBatchBytes flush loop in readGames: with the cap
+// off every game arrives in a single batch, and with a small cap the same games are
+// split across multiple batches without losing any rows.
+func TestChessByteCap(t *testing.T) {
+	const rowCount = 50
+	wide := strings.Repeat("x", 2048)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/games/archives") {
+			archiveURL := "http://" + r.Host + "/pub/player/tester/games/2024/01"
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"archives": []string{archiveURL},
+			})
+			return
+		}
+		games := make([]map[string]interface{}, 0, rowCount)
+		for i := 0; i < rowCount; i++ {
+			games = append(games, map[string]interface{}{
+				"url":  fmt.Sprintf("game-%d", i),
+				"blob": wide,
+			})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"games": games})
+	}))
+	defer srv.Close()
+
+	run := func(maxBytes int64) (int64, int64) {
+		s := &ChessSource{
+			players: []string{"tester"},
+			client:  httpclient.New(httpclient.WithBaseURL(srv.URL)),
+		}
+		results, err := s.readTable(context.Background(), s.readGames, source.ReadOptions{MaxBatchBytes: maxBytes})
+		if err != nil {
+			t.Fatalf("readTable: %v", err)
+		}
+		var batches, rows int64
+		for res := range results {
+			if res.Err != nil {
+				t.Fatalf("batch error: %v", res.Err)
+			}
+			batches++
+			rows += res.Batch.NumRows()
+			res.Batch.Release()
+		}
+		return batches, rows
+	}
+
+	offBatches, offRows := run(0)
+	onBatches, onRows := run(4096)
+
+	if offBatches != 1 {
+		t.Fatalf("cap-off batches=%d want 1", offBatches)
+	}
+	if onBatches <= 1 {
+		t.Fatalf("cap-on batches=%d want >1", onBatches)
+	}
+	if offRows != onRows || offRows != rowCount {
+		t.Fatalf("row mismatch off=%d on=%d want %d", offRows, onRows, rowCount)
+	}
+}
