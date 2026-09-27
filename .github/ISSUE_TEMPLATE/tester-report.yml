@@ -1,0 +1,63 @@
+name: Tester report
+description: Report the results of testing ats-fabric-connector against a Bullhorn tenant and Fabric workspace.
+title: "[tester-report] "
+labels:
+  - tester-report
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for testing. **Do not paste real Bullhorn data, credentials,
+        tenant identifiers, workspace/lakehouse names, or screenshots
+        containing records anywhere in this form.** Report aggregates only:
+        counts, column names and types, durations, call volumes and error
+        codes. If you need to identify your environment, describe its shape
+        (e.g. "Fabric F2 capacity", "Bullhorn instance with ~50k candidates")
+        rather than naming it.
+  - type: textarea
+    id: what-tested
+    attributes:
+      label: What did you test?
+      description: Which components (seed, incremental runner, reconciliation), which entities/tables, and roughly what data volume.
+      placeholder: |
+        - Ran the seed load for candidate, job_order, placement (~120k rows total)
+        - Ran three incremental runner cycles over 48 hours
+        - Ran the reconciliation job once
+    validations:
+      required: true
+  - type: textarea
+    id: environment-shape
+    attributes:
+      label: Environment shape (no identifiers)
+      description: Describe your Fabric and Bullhorn setup in general terms. Do not include workspace names, tenant IDs, or account identifiers.
+      placeholder: |
+        - Fabric capacity: F4
+        - Bullhorn: ATS Enterprise edition, API access via dedicated user
+        - Approx. record counts: candidates ~50k, job orders ~5k
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Aggregate results
+      description: Counts, durations, call volumes, error codes. No record content.
+      placeholder: |
+        - Seed: 118,432 rows loaded across 6 tables in 22 minutes
+        - Incremental run: avg 340 API calls, 90s duration
+        - Reconciliation: counts matched on 5/6 tables; 12 missing keys found on job_submission
+    validations:
+      required: true
+  - type: textarea
+    id: issues
+    attributes:
+      label: Anything unexpected?
+      description: Mismatches against the README, docs/supported-sources/bullhorn.md, or fabric/REPORT.md. Include HTTP status codes and error text, not record content.
+    validations:
+      required: false
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have not included any real Bullhorn data, credentials, tenant identifiers, or screenshots containing records in this report.
+          required: true

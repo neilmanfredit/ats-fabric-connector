@@ -1,0 +1,10 @@
+{
+  "entity": "Candidate",
+  "entityMetaUrl": "https://rest-east.bullhornstaffing.com/rest-services/e999/meta/Candidate?fields=*",
+  "label": "Candidate",
+  "fields": [
+    { "name": "id", "type": "ID", "dataType": "Integer", "label": "ID" },
+    { "name": "firstName", "type": "SCALAR", "dataType": "String", "label": "First Name" },
+    { "name": "dateLastModified", "type": "SCALAR", "dataType": "Timestamp", "label": "Date Last Modified" }
+  ]
+}

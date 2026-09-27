@@ -1,1100 +1,366 @@
-<div align="center">
-    <img src="https://github.com/bruin-data/ingestr/blob/main/resources/ingestr.svg?raw=true" width="500" />
-    <p>Copy data from any source to any destination without any code</p>
-    <img src="https://github.com/bruin-data/ingestr/blob/main/resources/demo.gif?raw=true" width="750" />
-</div>
+# ats-fabric-connector
 
-<div align="center" style="margin-top: 24px;">
-  <a target="_blank" href="https://join.slack.com/t/bruindatacommunity/shared_invite/zt-2dl2i8foy-bVsuMUauHeN9M2laVm3ZVg" style="background:none">
-    <img src="https://img.shields.io/badge/slack-join-dlt.svg?color=d95f5f&logo=slack" style="width: 180px;"  />
-  </a>
-</div>
+**Status: Alpha. Not for production use. Testers wanted.**
+
+Interfaces, table layouts and configuration may change between releases without notice. Read [Known limitations](#known-limitations) before you install.
+
+`ats-fabric-connector` moves Bullhorn ATS/CRM data into a Microsoft Fabric Lakehouse as Delta tables. It is for any organisation using Bullhorn that is moving reporting, analytics or downstream integration onto a data lake in Microsoft Fabric.
+
+It is derived from [ingestr](https://github.com/bruin-data/ingestr) by Bruin Data Limited. It adds a Bullhorn REST API source and a small toolkit for running a dependable, incremental feed into OneLake.
 
 ---
 
-ingestr is a command-line app that allows you to ingest data from any source into any destination using simple command-line flags, no code necessary.
+## Contents
 
-- ✨ copy data from your database into any destination
-- ➕ incremental loading: `append`, `merge` or `delete+insert`
-- 🐍 single-command installation
+1. [What it does](#what-it-does)
+2. [Why an API-based feed](#why-an-api-based-feed)
+3. [Architecture](#architecture)
+4. [Testers wanted](#testers-wanted)
+5. [Prerequisites](#prerequisites)
+6. [Bullhorn usage responsibilities](#bullhorn-usage-responsibilities)
+7. [Quick start](#quick-start)
+8. [Configuration](#configuration)
+9. [Tables delivered](#tables-delivered)
+10. [How deletes are handled](#how-deletes-are-handled)
+11. [API budget controls](#api-budget-controls)
+12. [Data protection](#data-protection)
+13. [Known limitations](#known-limitations)
+14. [Roadmap](#roadmap)
+15. [Contributing](#contributing)
+16. [Security](#security)
+17. [Licence](#licence)
+18. [Trademarks and affiliation](#trademarks-and-affiliation)
 
-ingestr takes away the complexity of managing any backend or writing any code for ingesting data, simply run the command and watch the data land on its destination.
+---
 
-![MongoDB to Postgres benchmark](resources/mongodb-postgres-benchmark.png?raw=true)
+## What it does
 
-## Installation
+1. **Reads Bullhorn through the REST API.** The connector handles data centre discovery, OAuth with refresh token rotation, session reuse and Bullhorn's rate-limit responses.
+2. **Writes Delta tables to OneLake.** Tables land in a Fabric Lakehouse and are immediately queryable from the SQL analytics endpoint, Spark and Power BI.
+3. **Loads incrementally.** Each run reads only records changed since the last successful run, keyed on `dateLastModified`, and merges them on the record ID.
+4. **Seeds without using the API.** The initial full load can come from an existing Bullhorn Data Replication database. This avoids spending the monthly API allowance on history.
+5. **Captures deletes.** Deletes are recorded from soft-delete flags, Bullhorn event subscriptions and scheduled reconciliation.
+6. **Reconciles.** Row counts and keys are compared between Bullhorn and the Lakehouse on a schedule, and the results are logged to a table.
+7. **Protects the API allowance.** Calls are tracked per run and per month. Non-critical entities are skipped before the allowance is breached.
 
-You can install `ingestr` using the install script:
+---
 
-```sh
-curl -LsSf https://getbruin.com/install/ingestr | sh
+## Why an API-based feed
+
+Many organisations take Bullhorn data through Bullhorn Data Replication, which copies Bullhorn into a customer-hosted SQL Server database. Two issues arise when that database becomes the route into Fabric.
+
+1. **Bullhorn's intended use.** Bullhorn describes Data Replication as a source for business intelligence and reporting. It advises against using it as a source for payroll, billing or similar systems, and lists API-based integration as the supported route for those uses. See [Understanding Bullhorn Data Replication](https://kb.bullhorn.com/ats/Content/BHATS/Topics/understandingDataMirror.htm).
+2. **Mirroring contention.** Fabric database mirroring reads the SQL Server transaction log to build its change feed. On a replication database that Bullhorn is continuously updating, this can contend with the replication process, particularly during the initial snapshot.
+
+This project takes a hybrid approach. The replication database seeds the history once, and the Bullhorn REST API carries ongoing change directly into Fabric.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Bullhorn
+        API[REST API]
+        EVT[Event subscriptions]
+    end
+    subgraph Customer
+        DR[(Data Replication<br/>SQL Server)]
+    end
+    subgraph Connector
+        SEED[Seed load<br/>one-off]
+        RUN[Runner<br/>scheduled]
+        REC[Reconciliation<br/>scheduled]
+    end
+    subgraph Fabric[Microsoft Fabric]
+        BRZ[(Bronze Lakehouse<br/>Delta tables)]
+        CTL[(Control state)]
+    end
+    DR --> SEED --> BRZ
+    API --> RUN --> BRZ
+    EVT --> RUN
+    API --> REC --> BRZ
+    RUN <--> CTL
 ```
 
-Alternatively, you can install it with pip:
+| Component | Purpose | Frequency |
+|---|---|---|
+| Seed load | Loads history from Data Replication using mapped SQL queries | Once per entity, and on reseed |
+| Runner | Computes the change window for each entity, reads the API and writes to OneLake | Scheduled |
+| Reconciliation | Compares counts and keys between Bullhorn and the Lakehouse | Scheduled |
+| Control state | Holds watermarks, subscription positions and API call totals | Updated each run |
 
-```sh
-pip install ingestr
-```
+Organisations without Data Replication can seed through the API instead. See [API budget controls](#api-budget-controls) for the cost of doing so.
 
-The pip package can also be used from Python. Install the SDK extra for Python data ingestion:
+---
 
-```sh
-pip install 'ingestr[sdk]'
-```
+## Testers wanted
 
-Python rows, generators, and DataFrames are sent to the `ingestr` CLI binary as Arrow IPC streams by default. The pip package downloads and caches the matching GitHub release binary on first use:
+The project is looking for organisations willing to test the alpha against a Bullhorn sandbox or a non-production Fabric workspace.
 
-```python
-import ingestr
+**Who is sought.** Organisations with the following:
 
-ingestr.ingest(
-    [{"id": 1, "name": "Ada"}, {"id": 2, "name": "Grace"}],
-    dest_uri="duckdb:///tmp/warehouse.duckdb",
-    dest_table="main.people",
-)
-```
+1. Bullhorn API access.
+2. A Microsoft Fabric capacity.
+3. An interest in moving Bullhorn data into a Fabric data lake.
 
-DataFrames and yielded data use the same Arrow stream transport:
+Experience with Bullhorn Data Replication is useful but not required.
 
-```python
-ingestr.ingest(df, dest_uri="duckdb:///tmp/warehouse.duckdb", dest_table="main.events")
+**What testing involves.**
 
-def events():
-    yield [{"id": 1, "event": "signup"}]
-    yield [{"id": 2, "event": "purchase"}]
+1. Installing the connector and running the seed, incremental and reconciliation steps.
+2. Following the checks in [`fabric/verification/RUNBOOK.md`](fabric/verification/RUNBOOK.md).
+3. Reporting results through the **Tester report** issue template.
 
-ingestr.ingest(events, dest_uri="postgresql://...", dest_table="public.events")
-```
+**What to report.** Aggregates only: row counts, column names and types, run durations, API call counts, error codes and the steps that led to a problem.
 
-For push-style code, omit the data argument and use `ingest` as a context manager. The context value accepts the same shapes as `ingestr.ingest(data, ...)`:
+**What never to report.** Bullhorn record data, credentials, tokens, corporation identifiers, tenant URLs, or screenshots that show records. Issues containing any of these will be removed.
 
-```python
-with ingestr.ingest(dest_uri="postgresql://...", dest_table="public.events") as ingest:
-    for response in client.list_events():
-        ingest(response["items"])
-```
+To register interest, open an issue using the **Tester report** template and select "Registering interest".
 
-For very large already-materialized data, use the existing mmap Arrow IPC file transport:
+---
 
-```python
-ingestr.ingest(df, dest_uri="duckdb:///tmp/warehouse.duckdb", dest_table="main.events", transport="mmap")
-```
+## Prerequisites
 
-For full CLI pass-through, use `ingestr.run(["ingest", "--source-uri", "...", "--dest-uri", "...", "--source-table", "..."])`, or `ingestr.run_cli(...)` for keyword arguments that map to CLI flags.
+| Requirement | Notes |
+|---|---|
+| Bullhorn edition with API access | The ATS Growth edition (formerly Team Edition) does not include API access for custom integrations. See [API Usage Limits](https://kb.bullhorn.com/ats/Content/BHATS/Topics/understandingBHAPIUsageLimitsVersioningBackwardCompatibility.htm). |
+| OAuth client ID with refresh tokens enabled | Request this from Bullhorn Support. See [Get Started with the Bullhorn REST API](https://bullhorn.github.io/Getting-Started-with-REST/). |
+| Dedicated Bullhorn API user | Used only by this connector. The user must accept the Bullhorn Terms of Service once, manually, before first use. |
+| Microsoft Fabric workspace and Lakehouse | A non-production workspace is recommended for testing. |
+| Microsoft Entra identity | A managed identity or service principal with Contributor access to the workspace. |
+| Build tooling | Go (version as declared in `go.mod`), `make`, and Docker if you are building the container. |
+| Bullhorn Data Replication (optional) | Required only if you are seeding from the replication database. |
 
+---
 
-## Quickstart
+## Bullhorn usage responsibilities
+
+Every organisation using this connector is responsible for its own compliance with the [Bullhorn API Fair Use Policy](https://bullhorn.github.io/api-fair-use-policy/) and its agreement with Bullhorn.
+
+At the time of writing, Bullhorn publishes the following limits in its [API Usage Limits](https://kb.bullhorn.com/ats/Content/BHATS/Topics/understandingBHAPIUsageLimitsVersioningBackwardCompatibility.htm) article. Check that article for current values, and check your own agreement with Bullhorn, which may differ.
+
+| Limit | Published default |
+|---|---|
+| API calls per month | 100,000, unless otherwise agreed with Bullhorn |
+| Requests per minute | 1,500, shared by all integrations using the same OAuth client ID |
+| Concurrent sessions | 50 |
+| Active event subscriptions | 50, with unused subscriptions and unretrieved events expiring after 30 days |
+
+**Points to note.**
+
+1. **The per-minute limit is shared.** If other integrations use the same OAuth client ID, set this connector's rate limit to its allocated share, not the full limit.
+2. **Transfer only what you need.** The Fair Use Policy restricts transferring more data than the permitted purpose requires. The connector enforces explicit field allowlists for this reason.
+3. **No AI or LLM tools.** The Fair Use Policy prohibits connecting the API to third-party AI or LLM tools without Bullhorn's explicit written permission. Do not connect this connector, or its outputs, to such tools on that basis without that permission.
+
+---
+
+## Quick start
+
+The commands below reflect the current alpha and may change.
+
+### 1. Build
 
 ```bash
-ingestr ingest \
-    --source-uri 'postgresql://admin:admin@localhost:8837/web?sslmode=disable' \
-    --source-table 'public.some_data' \
-    --dest-uri 'bigquery://<your-project-name>?credentials_path=/path/to/service/account.json' \
-    --dest-table 'ingestr.some_data'
+git clone https://github.com/neilmanfredit/ats-fabric-connector.git
+cd ats-fabric-connector
+export INGESTR_DISABLE_TELEMETRY=true DISABLE_TELEMETRY=true
+make build
+git config core.hooksPath fabric/githooks   # contributors only
 ```
 
-That's it.
+### 2. Configure
 
-This command:
+```bash
+cp fabric/runner/entities.example.yaml fabric/runner/entities.yaml
+```
 
-- gets the table `public.some_data` from the Postgres instance.
-- uploads this data to your BigQuery warehouse under the schema `ingestr` and table `some_data`.
+Edit `entities.yaml` to set the entities, field allowlists and schedule groups you need. Keep credentials in a secret store or environment variables, never in this file.
 
-## Documentation
+### 3. Seed from Data Replication (optional)
 
-You can see the full documentation [here](https://bruin-data.github.io/ingestr/getting-started/quickstart.html).
+Review the mapping queries in `fabric/seed/mappings/` with your database administrator, then run the seed outside peak hours:
 
-## Community
+```bash
+fabric/seed/run-seed.sh --entity placement
+```
 
-Join our Slack community [here](https://join.slack.com/t/bruindatacommunity/shared_invite/zt-2dl2i8foy-bVsuMUauHeN9M2laVm3ZVg).
+The seed records a starting watermark for each entity it loads.
+
+### 4. Run the first incremental
+
+```bash
+go run ./fabric/runner --config fabric/runner/entities.yaml
+```
+
+### 5. Reconcile
+
+```bash
+go run ./fabric/reconcile --config fabric/runner/entities.yaml --mode counts
+```
+
+Check `Tables/bullhorn/reconciliation_log` in your Lakehouse for the results.
+
+### Using the source directly
+
+The Bullhorn source can also be used as a standard ingestr source:
+
+```bash
+bin/ingestr ingest \
+  --source-uri "bullhorn://?client_id=...&client_secret=...&refresh_token=...&username=...&data_center=...&rate_limit=...&token_output=..." \
+  --source-table "placement" \
+  --dest-uri "onelake://<workspace>/<lakehouse>?use_azure_default_credential=true" \
+  --dest-table "Tables/bullhorn/placement" \
+  --incremental-strategy merge \
+  --interval-start "2026-01-01T00:00:00Z"
+```
+
+---
+
+## Configuration
+
+### Source URI parameters
+
+| Parameter | Required | Description |
+|---|---|---|
+| `client_id` | Yes | Bullhorn OAuth client ID |
+| `client_secret` | Yes | Bullhorn OAuth client secret |
+| `refresh_token` | One of | Existing refresh token. Bullhorn issues a new refresh token on every refresh and invalidates the previous one. |
+| `username`, `password` | One of | Used for the initial authorisation code flow only, when no refresh token is held |
+| `data_center` | Yes | Validated against Bullhorn's `loginInfo` response for the API user |
+| `rate_limit` | Yes | Requests per second. There is no default. Set it to no more than 80 per cent of the share of the per-minute limit allocated to this connector. |
+| `token_output` | Yes | Path to which each rotated refresh token is written, with owner-only permissions |
+
+### Runner settings
+
+| Setting | Description |
+|---|---|
+| `entities` | Entity list with endpoint type, field allowlist, primary key, strategy, schedule group and critical flag |
+| `overlap` | Window subtracted from each watermark to allow for clock skew and late-arriving changes |
+| `budget.monthly_allowance` | Monthly API call allowance agreed with Bullhorn |
+| `budget.threshold` | Share of the allowance at which non-critical entities are skipped |
+| `secret_store` | `file` or `azure_key_vault`, used for persisting rotated refresh tokens |
+| `state_path` | Location of the control state in the Lakehouse, by default `Files/control/bullhorn_state.json` |
+
+See [`docs/supported-sources/bullhorn.md`](docs/supported-sources/bullhorn.md) for what each table holds, and [`fabric/runner/entities.example.yaml`](fabric/runner/entities.example.yaml) for a complete worked configuration.
+
+---
+
+## Tables delivered
+
+Default tables are written under `Tables/bullhorn/` in the target Lakehouse.
+
+| Table | Bullhorn entity | Key | Load pattern |
+|---|---|---|---|
+| `candidate` | Candidate | `id` | Incremental merge |
+| `client_corporation` | ClientCorporation | `id` | Incremental merge |
+| `client_contact` | ClientContact | `id` | Incremental merge |
+| `job_order` | JobOrder | `id` | Incremental merge |
+| `placement` | Placement | `id` | Incremental merge |
+| `job_submission` | JobSubmission | `id` | Incremental merge |
+| `corporate_user` | CorporateUser | `id` | Incremental merge |
+| `entity_metadata` | Field metadata | `entity`, `field_name` | Full replace |
+| `deleted_records` | Deletes from all sources | `entity`, `entity_id`, `event_id` | Incremental merge |
+| `reconciliation_log` | Reconciliation results | Run and entity | Append |
+
+1. **Adding entities.** Further entities can be added through configuration without code changes.
+2. **Column typing.** Only `id`, `dateLastModified` and `isDeleted` are typed columns. Nested objects and associations are kept as JSON columns.
+3. **Timestamps.** Bullhorn returns timestamps as epoch milliseconds. They are stored as microsecond-precision Delta timestamps.
+4. **Associations.** Bullhorn returns only a limited number of records for to-many associations. Load associated entities as their own tables rather than relying on the nested values.
+
+---
+
+## How deletes are handled
+
+Bronze tables are never pruned. Deletes are recorded separately so that downstream layers can apply them in a controlled and auditable way.
+
+| Delete type | Source |
+|---|---|
+| Soft delete | The `isDeleted` flag arrives through normal incrementals, and a row is also written to `deleted_records` |
+| Hard delete | `DELETED` events from Bullhorn event subscriptions |
+| Missed or historical deletes | Scheduled key reconciliation |
+
+Applying deletes to Silver or Gold layers is the responsibility of each organisation's downstream processing.
+
+---
+
+## API budget controls
+
+1. **Tracking.** The runner records calls per entity per run and keeps a month-to-date total in the control state.
+2. **Protection.** Before each run, the runner projects month-end usage. Above the configured threshold, it skips entities not marked critical and exits with a warning code for your scheduler to alert on.
+3. **Budget model.** `fabric/REPORT.md` explains how to estimate calls per run, per month and per reconciliation from your change volumes.
+
+**Seeding through the API.** A full API seed costs roughly one call per page of records for each entity. Estimate it before you start. For large Bullhorn databases, a seed can consume a significant share of the default monthly allowance.
+
+---
+
+## Data protection
+
+Bullhorn data includes personal data about candidates, contacts and users.
+
+1. **Field allowlists.** Every entity read uses an explicit field allowlist, and wildcard selection is not supported. The example configuration excludes national identifiers and other special category fields. Include them only with your data owner's approval.
+2. **Logging.** Logs contain entity names, counts, durations, call volumes and error codes only. Record content is never logged.
+3. **Secrets.** Refresh tokens are written only to the configured secret store or token path, and are never logged.
+4. **Local-only files.** The repository ignores and blocks commits of environment files, tokens, keys, runtime state and verification results. See `.gitignore` and `fabric/scripts/check-sensitive-files.sh`.
+5. **Your obligations.** Each organisation remains the controller of its Bullhorn data. It is responsible for access controls, retention and masking in its own Fabric workspace.
+
+---
+
+## Known limitations
+
+1. The project is alpha software, tested against mocked Bullhorn responses and a limited number of sandbox tenants.
+2. The Lucene and JPQL date range formats and bound inclusivity are still being confirmed across tenants.
+3. Maximum page depth varies by endpoint. Very large entities may require date-window paging, which is still being validated.
+4. Pay and bill entities are not in the default table set. Entity names and effective-dating behaviour are still being confirmed.
+5. The OneLake destination does not apply deletes during merge, which is why deletes are recorded in `deleted_records` instead.
+6. Only one runner may operate per Bullhorn API user, because refresh tokens are single-use.
+7. Only Bullhorn is supported at present.
+
+---
+
+## Roadmap
+
+The following items are under consideration and depend on tester feedback. None is committed.
+
+1. Pay and bill entity coverage.
+2. Date-window paging for very large entities.
+3. A Fabric notebook deployment option alongside the container job.
+4. Example Silver-layer transformations for applying deletes.
+5. Support for other ATS platforms, subject to demand and each vendor's API terms.
+
+---
 
 ## Contributing
 
-Pull requests are welcome. However, please open an issue first to discuss what you would like to change. We maybe able to offer you help and feedback regarding any changes you would like to make.
+Contributions are welcome through pull requests. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening one. It covers four areas.
 
-> [!NOTE]
-> After cloning `ingestr` make sure to run `make setup` to install githooks.
+1. **Commit messages.** Commit messages and pull request text must be plain and descriptive, with no tool-generated attribution trailers. CI rejects pull requests that contain them.
+2. **Data and secrets.** Never include Bullhorn data, credentials or tenant details in code, tests, fixtures, issues or pull requests. Test fixtures must be built from the examples in Bullhorn's public [REST API documentation](https://bullhorn.github.io/rest-api-docs/).
+3. **Checks.** Run `make format`, `make lint` and `make test` before submitting.
+4. **Scope.** Changes to the shared upstream packages should be discussed in an issue first.
 
-## Supported sources & destinations
-<table>
-    <tr>
-        <th></th>
-        <th>Source</th>
-        <th>Destination</th>
-        <th>CDC</th>
-    </tr>
-    <tr>
-        <td colspan="4" style='text-align:center;'><strong>Databases</strong></td>
-    </tr>
-    <tr>
-        <td>Apache Iceberg</td>
-        <td>-</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Apache Pulsar</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>AWS Athena</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>AWS Redshift</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Amazon SQS</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Azure Event Hubs</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Cassandra</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>ClickHouse</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Couchbase</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>CrateDB</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Databricks</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>DuckDB</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>DynamoDB</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Elasticsearch</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>GCP Spanner</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Google BigQuery</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Google Cloud Pub/Sub</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>HTTP</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>IBM Db2</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>InfluxDB</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Kafka</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Local Avro file</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Local CSV file</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Local JSON file</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Local JSONL file</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Local Parquet file</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>MaxCompute</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Microsoft Fabric</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Microsoft OneLake</td>
-        <td>-</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Microsoft SQL Server</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>✅</td>
-    </tr>
-    <tr>
-        <td>MongoDB</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>✅</td>
-    </tr>
-    <tr>
-        <td>MotherDuck</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>MQTT</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>MySQL</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>✅</td>
-    </tr>
-    <tr>
-        <td>NATS</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Oracle</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>PlanetScale</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>✅</td>
-    </tr>
-    <tr>
-        <td>Postgres</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>✅</td>
-    </tr>
-    <tr>
-        <td>RabbitMQ</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Redis</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>SAP Hana</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Snowflake</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Socrata</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>SQLite</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>StarRocks</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Synapse</td>
-        <td>-</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Trino</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Vertica</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Vitess</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>✅</td>
-    </tr>
-    <tr>
-        <td colspan="4" style='text-align:center;'><strong>Platforms</strong></td>
-    </tr>
-    <tr>
-        <td>2Checkout</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>ABRA Flexi</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Adjust</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Adapty</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Airtable</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Allium</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Amazon Kinesis</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Amplitude</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Anthropic</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>API-Football</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>AppsFlyer</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Apple Ads</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Apple App Store</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Applovin</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Applovin Max</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Asana</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Attio</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Azure Data Lake Storage Gen2</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>BallDontLie FIFA</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>BambooHR</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Braze</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Bruin</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Chargebee</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Chess.com</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>CleverTap</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>ClickUp</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Cloudflare Radar</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Cursor</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Customer.io</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Deel</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Docebo</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Dune</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>ESPN</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Facebook Ads</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>FastSpring</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Fireflies</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Fluxx</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>football-data.org</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Frankfurter</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Freshdesk</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>FundraiseUp</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>G2</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>GitHub</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>GitLab</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Google Ads</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Google Analytics</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Google Cloud Storage (GCS)</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Google Search Console</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Google Sheets</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Gorgias</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Granola</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Hostaway</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>HubSpot</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Indeed</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Intercom</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Internet Society Pulse</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Jira</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>JobTread</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Kalshi</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Klaviyo</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Linear</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>LinkedIn Ads</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Lumify</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Mailchimp</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Manifold</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Mixpanel</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Monday</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Notion</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Okta</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>OpenAI</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Paddle</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Payrails</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Personio</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>PhantomBuster</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Pinterest</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Pipedrive</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Plus Vibe AI</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Polymarket</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>PostHog</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Primer</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>QuickBooks</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Recurly</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Reddit Ads</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>RevenueCat</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>RIPEstat</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>S3</td>
-        <td>✅</td>
-        <td>✅</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Salesforce</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>SatisMeter</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>SendGrid</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>SFTP</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>SharePoint</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Shopify</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Sklik</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Slack</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Smartsheet</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Snapchat Ads</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Solidgate</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Square</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Stripe</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Sumble</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>SurveyMonkey</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>TikTok Ads</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Trello</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Trustpilot</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Twenty</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Twilio</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Typeform</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Wise</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Wistia</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Zendesk</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-    <tr>
-        <td>Zoom</td>
-        <td>✅</td>
-        <td>-</td>
-        <td>-</td>
-    </tr>
-</table>
+---
 
-Feel free to create an issue if you'd like to see support for another source or destination.
+## Security
 
-## License
+Report vulnerabilities privately through GitHub's private vulnerability reporting, as described in [`SECURITY.md`](SECURITY.md). Do not open public issues for security matters.
 
-ingestr is source-available under the [Functional Source License 1.1](https://fsl.software/), with Apache 2.0 as the future license. You can use ingestr freely for internal production use, development, testing, education, research, and professional services. You cannot use ingestr to offer a competing commercial ingestion, ELT, connector, or managed data pipeline product/service.
+---
 
-Each version becomes Apache 2.0 two years after release.
+## Licence
+
+This project is a derivative of ingestr and is distributed under the same licence: the [Functional Source License, Version 1.1, ALv2 Future License](LICENSE) (FSL-1.1-ALv2).
+
+1. **Permitted uses.** The licence permits internal use, non-commercial education and research, and professional services provided to a licensee.
+2. **Competing use.** It does not permit making the software available to others in a commercial product or service that substitutes for ingestr or offers substantially similar functionality. Offering this project as a paid or hosted ingestion service is therefore not permitted.
+3. **Future licence.** Each upstream ingestr version becomes available under the Apache License 2.0 on the second anniversary of its release, as set out in the licence.
+4. **Notices.** Original ingestr copyright notices are retained. Modifications are described in [`NOTICE`](NOTICE).
+5. **Third-party components.** Third-party dependency licences are listed in [`THIRD_PARTY_LICENSES.txt`](THIRD_PARTY_LICENSES.txt).
+
+---
+
+## Trademarks and affiliation
+
+Bullhorn is a trademark of Bullhorn, Inc. ingestr is a product of Bruin Data Limited. Microsoft, Microsoft Fabric and OneLake are trademarks of Microsoft Corporation.
+
+This project is independent. It is not affiliated with, endorsed by or supported by Bullhorn, Inc., Bruin Data Limited or Microsoft Corporation. Product names are used only to describe compatibility and to identify the origin of the software.

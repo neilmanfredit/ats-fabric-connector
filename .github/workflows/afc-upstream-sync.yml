@@ -1,0 +1,90 @@
+name: afc-upstream-sync
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  INGESTR_DISABLE_TELEMETRY: "true"
+  DISABLE_TELEMETRY: "true"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "afc-upstream-sync"
+          git config user.email "actions@users.noreply.github.com"
+
+      - name: Fetch upstream-snapshot
+        run: git fetch origin upstream-snapshot:upstream-snapshot
+
+      - name: Import latest upstream release into upstream-snapshot
+        id: import
+        run: |
+          git switch upstream-snapshot
+          BEFORE_SHA=$(git rev-parse HEAD)
+          fabric/scripts/snapshot-upstream.sh
+          AFTER_SHA=$(git rev-parse HEAD)
+          if [ "$BEFORE_SHA" = "$AFTER_SHA" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          TAG=$(git log -1 --format=%s | sed -E 's/^Import upstream ingestr ([^ ]+) at .*/\1/')
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Push updated upstream-snapshot
+        if: steps.import.outputs.changed == 'true'
+        run: git push origin upstream-snapshot
+
+      - name: Create sync branch from main and merge snapshot
+        id: merge
+        if: steps.import.outputs.changed == 'true'
+        run: |
+          SYNC_BRANCH="sync/upstream-${{ steps.import.outputs.tag }}"
+          git switch main
+          git switch -c "$SYNC_BRANCH"
+          if git merge --no-edit upstream-snapshot; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            git push origin "$SYNC_BRANCH"
+          else
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "branch=${SYNC_BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Open pull request
+        if: steps.import.outputs.changed == 'true' && steps.merge.outputs.conflict == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --base main \
+            --head "${{ steps.merge.outputs.branch }}" \
+            --title "Sync upstream ingestr ${{ steps.import.outputs.tag }}" \
+            --body "Automated weekly import of upstream ingestr ${{ steps.import.outputs.tag }} into upstream-snapshot, merged cleanly into this branch."
+
+      - name: Open issue on conflict
+        if: steps.import.outputs.changed == 'true' && steps.merge.outputs.conflict == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "Upstream sync conflict: ingestr ${{ steps.import.outputs.tag }}" \
+            --body "The weekly upstream sync could not merge upstream-snapshot (${{ steps.import.outputs.tag }}) into main without conflicts. Resolve manually: fetch upstream-snapshot, branch from main, merge, fix conflicts, open a pull request."

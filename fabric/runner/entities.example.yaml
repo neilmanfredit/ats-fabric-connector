@@ -1,0 +1,205 @@
+# Example runner configuration. Copy to entities.yaml and adjust before use.
+#
+# Each entry configures one Bronze table. `endpoint` selects how the
+# bullhorn:// source reads it (search/query/meta/subscription; see
+# docs/supported-sources/bullhorn.md). `allowlist` is mandatory and explicit
+# for search/query entities — wildcard field selection is not permitted
+# (build brief section 2.2.4). `schedule_group` only labels which runner
+# invocation an entity belongs to; the runner does not interpret it beyond
+# grouping. `critical: false` entities are the first ones skipped when the
+# monthly API budget projection exceeds the configured threshold (section
+# 6.6.2).
+#
+# To add a new entity without code changes, add another list item here with
+# endpoint: query and the field allowlist you want. The source treats any
+# table name it does not already know as a JPQL query-style read against the
+# entity named in `entity`.
+
+entities:
+  - table: candidate
+    entity: Candidate
+    endpoint: search
+    primary_key: [id]
+    incremental_key: dateLastModified
+    strategy: merge
+    schedule_group: frequent
+    critical: true
+    allowlist:
+      - id
+      - firstName
+      - lastName
+      - email
+      - status
+      - isDeleted
+      - dateAdded
+      - dateLastModified
+      - owner
+      - source
+      - candidateSource
+
+  - table: client_corporation
+    entity: ClientCorporation
+    endpoint: search
+    primary_key: [id]
+    incremental_key: dateLastModified
+    strategy: merge
+    schedule_group: frequent
+    critical: true
+    allowlist:
+      - id
+      - name
+      - status
+      - isDeleted
+      - dateAdded
+      - dateLastModified
+      - owner
+      - industryList
+
+  - table: client_contact
+    entity: ClientContact
+    endpoint: search
+    primary_key: [id]
+    incremental_key: dateLastModified
+    strategy: merge
+    schedule_group: frequent
+    critical: true
+    allowlist:
+      - id
+      - firstName
+      - lastName
+      - email
+      - status
+      - isDeleted
+      - dateAdded
+      - dateLastModified
+      - clientCorporation
+      - owner
+
+  - table: job_order
+    entity: JobOrder
+    endpoint: search
+    primary_key: [id]
+    incremental_key: dateLastModified
+    strategy: merge
+    schedule_group: frequent
+    critical: true
+    allowlist:
+      - id
+      - title
+      - status
+      - isDeleted
+      - isOpen
+      - dateAdded
+      - dateLastModified
+      - dateEnd
+      - clientCorporation
+      - owner
+      - employmentType
+      - numOpenings
+
+  - table: placement
+    entity: Placement
+    endpoint: search
+    primary_key: [id]
+    incremental_key: dateLastModified
+    strategy: merge
+    schedule_group: frequent
+    critical: true
+    allowlist:
+      - id
+      - status
+      - isDeleted
+      - dateAdded
+      - dateLastModified
+      - dateBegin
+      - dateEnd
+      - candidate
+      - jobOrder
+      - clientCorporation
+      - employmentType
+
+  - table: job_submission
+    entity: JobSubmission
+    endpoint: query
+    primary_key: [id]
+    incremental_key: dateLastModified
+    strategy: merge
+    schedule_group: hourly
+    critical: false
+    allowlist:
+      - id
+      - status
+      - isDeleted
+      - dateAdded
+      - dateLastModified
+      - candidate
+      - jobOrder
+      - sendingUser
+
+  - table: corporate_user
+    entity: CorporateUser
+    endpoint: query
+    primary_key: [id]
+    incremental_key: dateLastModified
+    strategy: merge
+    schedule_group: daily
+    critical: false
+    allowlist:
+      - id
+      - name
+      - email
+      - isDeleted
+      - dateLastModified
+      - departments
+
+  - table: entity_metadata
+    entity: ""
+    endpoint: meta
+    primary_key: [entity, field_name]
+    incremental_key: ""
+    strategy: replace
+    schedule_group: daily
+    critical: false
+    # Metadata calls return field names, labels and types only — never entity
+    # field values — so no allowlist applies (build brief section 6.4.3).
+    meta_entities:
+      - Candidate
+      - ClientCorporation
+      - ClientContact
+      - JobOrder
+      - Placement
+      - JobSubmission
+      - CorporateUser
+
+  - table: deleted_records
+    entity: ""
+    endpoint: subscription
+    primary_key: [entity, entity_id, event_id]
+    incremental_key: event_timestamp
+    strategy: merge
+    schedule_group: frequent
+    critical: true
+    # Subscribes once, covering every entity below, to stay well under the
+    # 50-subscription account cap (build brief section 6.1.11.3).
+    subscribed_entities:
+      - Candidate
+      - ClientCorporation
+      - ClientContact
+      - JobOrder
+      - Placement
+      - JobSubmission
+      - CorporateUser
+
+# Runner-wide settings.
+runner:
+  # Overlap applied to every watermark before each run, to tolerate
+  # dateLastModified clock skew and eventual-consistency delay.
+  watermark_overlap: 5m
+  # Month-to-date call budget threshold (build brief section 6.6.2). When
+  # projected month-end usage exceeds this fraction of the monthly limit,
+  # non-critical entities are skipped for the rest of the month.
+  budget_threshold_fraction: 0.8
+  # Vendor default (build brief section 6.1.12.2); override if your account
+  # has a different plan.
+  monthly_call_limit: 100000
+  secret_store: file # "file" or "keyvault"

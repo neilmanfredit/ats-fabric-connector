@@ -1,0 +1,66 @@
+# Example Azure Container Apps job definition for the Bullhorn runner.
+# Every value below is a placeholder. Do not commit a filled-in copy of this
+# file anywhere in this repository (see fabric/scripts/check-sensitive-files.sh).
+#
+# Deploy with:
+#   az containerapp job create --resource-group <resource-group> \
+#     --name <job-name> --yaml containerapp-job.yaml
+properties:
+  configuration:
+    triggerType: Schedule
+    scheduleTriggerConfig:
+      # Every 30 minutes; adjust to match the schedule groups in entities.yaml.
+      cronExpression: "*/30 * * * *"
+      parallelism: 1
+      replicaCompletionCount: 1
+    replicaTimeout: 3600
+    replicaRetryLimit: 0
+    secrets:
+      - name: bullhorn-client-secret
+        keyVaultUrl: "https://<key-vault-name>.vault.azure.net/secrets/<secret-name>"
+        identity: "<user-assigned-identity-resource-id>"
+      - name: bullhorn-refresh-token
+        keyVaultUrl: "https://<key-vault-name>.vault.azure.net/secrets/<secret-name>"
+        identity: "<user-assigned-identity-resource-id>"
+  template:
+    containers:
+      - image: "ghcr.io/<org>/ats-fabric-connector:<tag>"
+        name: bullhorn-runner
+        env:
+          - name: INGESTR_DISABLE_TELEMETRY
+            value: "true"
+          - name: DISABLE_TELEMETRY
+            value: "true"
+          - name: BULLHORN_CLIENT_ID
+            value: "<client-id>"
+          - name: BULLHORN_CLIENT_SECRET
+            secretRef: bullhorn-client-secret
+          - name: BULLHORN_REFRESH_TOKEN
+            secretRef: bullhorn-refresh-token
+          - name: BULLHORN_USERNAME
+            value: "<api-user>"
+          - name: BULLHORN_DATA_CENTER
+            value: "<data-center>"
+          - name: BULLHORN_RATE_LIMIT
+            value: "<requests-per-second>"
+          - name: ONELAKE_WORKSPACE
+            value: "<fabric-workspace>"
+          - name: ONELAKE_LAKEHOUSE
+            value: "<fabric-lakehouse>"
+          - name: AFC_ENTITIES_CONFIG
+            value: "/app/entities.yaml"
+          - name: AFC_SECRET_STORE
+            value: "keyvault"
+          - name: AFC_KEY_VAULT_URL
+            value: "https://<key-vault-name>.vault.azure.net/"
+        resources:
+          cpu: 0.5
+          memory: 1Gi
+    identity:
+      type: UserAssigned
+      userAssignedIdentities:
+        "<user-assigned-identity-resource-id>": {}
+  identity:
+    type: UserAssigned
+    userAssignedIdentities:
+      "<user-assigned-identity-resource-id>": {}
