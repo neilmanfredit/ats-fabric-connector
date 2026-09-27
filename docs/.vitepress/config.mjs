@@ -1,0 +1,308 @@
+import { defineConfig } from "vitepress";
+
+// https://vitepress.dev/reference/site-config
+export default defineConfig({
+  title: "ingestr",
+  description: "Ingest & copy data between any source and any destination",
+  base: "/ingestr/",
+  sitemap: {
+    hostname: 'https://getbruin.com',
+    transformItems: (items) => {
+      return items.map((item) => {
+        const cleaned = item.url.replace(/^\/ingestr\//, '');
+        item.url = `https://getbruin.com/docs/ingestr/${cleaned}`;
+        return item;
+      });
+    },
+    trailingSlash: true,
+  },
+  transformPageData(pageData) {
+    const canonicalUrl = `https://getbruin.com/docs/ingestr/${pageData.relativePath}`
+      .replace(/index\.md$/, '')
+      .replace(/\.md$/, '.html')
+
+    pageData.frontmatter.head ??= []
+    pageData.frontmatter.head.push([
+      'link',
+      { rel: 'canonical', href: canonicalUrl }
+    ])
+  },
+  head: [
+    [
+      "script",
+      {},
+      `(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+})(window,document,'script','dataLayer','GTM-K2L7S5FP');`,
+    ],
+    [
+      "noscript",
+      {},
+      `<iframe src="https://www.googletagmanager.com/ns.html?id=GTM-K2L7S5FP" height="0" width="0" style="display:none;visibility:hidden"></iframe>`,
+    ],
+  ],
+  themeConfig: {
+    // https://vitepress.dev/reference/default-theme-config
+    nav: [
+      { text: "Introduction", link: "/" },
+      { text: "Quickstart", link: "/getting-started/quickstart.md" },
+    ],
+    outline: "deep",
+    search: {
+      provider: 'local'
+    },
+
+    sidebar: [
+      {
+        text: "Introduction",
+        link: "/",
+        items: [
+          { text: "Quickstart", link: "/getting-started/quickstart.md" },
+          { text: "Python SDK", link: "/getting-started/python-sdk.md" },
+          { text: "Core Concepts", link: "/getting-started/core-concepts.md" },
+          {
+            text: "Incremental Loading",
+            link: "/getting-started/incremental-loading.md",
+          },
+          {
+            text: "Change Data Capture (CDC)",
+            link: "/getting-started/cdc.md",
+          },
+          { text: "Reverse ETL", link: "/getting-started/reverse-etl.md" },
+          { text: "Data Masking", link: "/getting-started/data-masking.md" },
+          { text: "Migration Guide", link: "/getting-started/migration-to-v1.md" },
+          { text: "Telemetry", link: "/getting-started/telemetry.md" },
+        ],
+      },
+      {
+        text: "Commands",
+        items: [
+          { text: "ingest", link: "/commands/ingest.md" },
+          { text: "server", link: "/commands/server.md" },
+          { text: "example-uris", link: "/commands/example-uris.md" },
+        ],
+      },
+      {
+        text: "Tutorials",
+        items: [
+          { text: "Load Kinesis Data to BigQuery", link: "/tutorials/load-kinesis-bigquery.md" },
+          { text: "Load Personio Data to DuckDB", link: "/tutorials/load-personio-duckdb.md" },
+          { text: "Load Stripe Data to Postgres", link: "/tutorials/load-stripe-postgres.md" },
+        ],
+      },
+      {
+        text: "Sources & Destinations",
+        items: [
+          {
+            text: "Databases",
+            collapsed: false,
+            items: [
+              { text: "AWS Athena", link: "/supported-sources/athena.md" },
+              { text: "Apache Iceberg", link: "/supported-sources/iceberg.md" },
+              { text: "AWS Redshift", link: "/supported-sources/redshift.md" },
+              { text: "Cassandra", link: "/supported-sources/cassandra.md" },
+              { text: "ClickHouse", link: "/supported-sources/clickhouse.md" },
+              { text: "Couchbase", link: "/supported-sources/couchbase.md" },
+              { text: "CrateDB", link: "/supported-sources/cratedb.md" },
+              { text: "Databricks", link: "/supported-sources/databricks.md" },
+              { text: "DuckDB", link: "/supported-sources/duckdb.md" },
+              { text: "DynamoDB", link: "/supported-sources/dynamodb.md" },
+              { text: "Elasticsearch", link: "/supported-sources/elasticsearch.md" },
+              {
+                text: "Google BigQuery",
+                link: "/supported-sources/bigquery.md",
+              },
+              { text: "GCP Spanner", link: "/supported-sources/spanner.md" },
+              { text: "IBM Db2", link: "/supported-sources/db2.md" },
+              { text: "InfluxDB", link: "/supported-sources/influxdb.md" },
+              { text: "Kafka", link: "/supported-sources/kafka.md" },
+              { text: "Local CSV Files", link: "/supported-sources/csv.md" },
+              {
+                text: "Microsoft Fabric",
+                link: "/supported-sources/fabric.md",
+              },
+              {
+                text: "Microsoft OneLake",
+                link: "/supported-sources/onelake.md",
+              },
+              {
+                text: "Microsoft SQL Server",
+                link: "/supported-sources/mssql.md",
+                collapsed: true,
+                items: [
+                  { text: "CDC to DuckDB Tutorial", link: "/tutorials/cdc-sqlserver-duckdb.md" },
+                ],
+              },
+              {
+                text: "MongoDB",
+                link: "/supported-sources/mongodb.md",
+                collapsed: true,
+                items: [
+                  { text: "CDC to DuckDB Tutorial", link: "/tutorials/cdc-mongodb-duckdb.md" },
+                ],
+              },
+              { text: "MotherDuck", link: "/supported-sources/motherduck.md" },
+              {
+                text: "MySQL",
+                link: "/supported-sources/mysql.md",
+                collapsed: true,
+                items: [
+                  { text: "CDC to DuckDB Tutorial", link: "/tutorials/cdc-mysql-duckdb.md" },
+                ],
+              },
+              { text: "Oracle", link: "/supported-sources/oracle.md" },
+              { text: "PlanetScale", link: "/supported-sources/planetscale.md" },
+              {
+                text: "Postgres",
+                link: "/supported-sources/postgres.md",
+                collapsed: true,
+                items: [
+                  { text: "CDC to DuckDB Tutorial", link: "/tutorials/cdc-postgres-duckdb.md" },
+                ],
+              },
+              { text: "RabbitMQ", link: "/supported-sources/rabbitmq.md" },
+              { text: "SAP Hana", link: "/supported-sources/sap-hana.md" },
+              { text: "Snowflake", link: "/supported-sources/snowflake.md" },
+              { text: "Socrata", link: "/supported-sources/socrata.md" },
+              { text: "SQLite", link: "/supported-sources/sqlite.md" },
+              { text: "StarRocks", link: "/supported-sources/starrocks.md" },
+              { text: "Vertica", link: "/supported-sources/vertica.md" },
+              { text: "Vitess", link: "/supported-sources/vitess.md" },
+              {
+                text: "Experimental",
+                items: [
+                  { text: "Custom Queries", link: "/supported-sources/custom_queries.md" },
+                ],
+              },
+            ],
+          },
+
+          {
+            text: "Platforms",
+            link: "/supported-sources/platforms.md",
+            collapsed: false,
+            items: [
+              { text: "ABRA Flexi", link: "/supported-sources/abra.md" },
+              { text: "Adjust", link: "/supported-sources/adjust.md" },
+              { text: "Airtable", link: "/supported-sources/airtable.md" },
+              { text: "Allium", link: "/supported-sources/allium.md" },
+              { text: "Amazon Kinesis", link: "/supported-sources/kinesis.md" },
+              { text: "Amplitude", link: "/supported-sources/amplitude.md" },
+              { text: "Anthropic", link: "/supported-sources/anthropic.md" },
+              { text: "API-Football", link: "/supported-sources/api-football.md" },
+              { text: "AppsFlyer", link: "/supported-sources/appsflyer.md" },
+              { text: "Apple Ads", link: "/supported-sources/appleads.md"},
+              { text: "Apple App Store", link: "/supported-sources/appstore.md"},
+              { text: "Applovin", link: "/supported-sources/applovin.md"},
+              { text: "Applovin Max", link: "/supported-sources/applovin_max.md"},
+              { text: "Asana", link: "/supported-sources/asana.md" },
+              { text: "Attio", link: "/supported-sources/attio.md" },
+              { text: "Azure Data Lake Storage Gen2", link: "/supported-sources/adls.md" },
+              { text: "BallDontLie FIFA", link: "/supported-sources/balldontlie.md" },
+              { text: "BambooHR", link: "/supported-sources/bamboohr.md" },
+              { text: "Braze", link: "/supported-sources/braze.md" },
+              { text: "Bruin", link: "/supported-sources/bruin.md" },
+              { text: "Chargebee", link: "/supported-sources/chargebee.md" },
+              { text: "Chess.com", link: "/supported-sources/chess.md" },
+              { text: "CleverTap", link: "/supported-sources/clevertap.md" },
+              { text: "ClickUp", link: "/supported-sources/clickup.md" },
+              { text: "Cursor", link: "/supported-sources/cursor.md" },
+              { text: "Deel", link: "/supported-sources/deel.md" },
+              { text: "Docebo", link: "/supported-sources/docebo.md" },
+              { text: "Dune", link: "/supported-sources/dune.md" },
+              { text: "Exchangerates API", link: "/supported-sources/exchangeratesapi.md" },
+              {
+                text: "Facebook Ads",
+                link: "/supported-sources/facebook-ads.md",
+              },
+              { text: "Fakturoid", link: "/supported-sources/fakturoid.md" },
+              { text: "FastSpring", link: "/supported-sources/fastspring.md" },
+              { text: "Fireflies", link: "/supported-sources/fireflies.md" },
+              { text: "Fluxx", link: "/supported-sources/fluxx.md" },
+              { text: "football-data.org", link: "/supported-sources/football-data-org.md" },
+              { text: "Frankfurter", link: "/supported-sources/frankfurter.md" },
+              { text: "Freshdesk", link: "/supported-sources/freshdesk.md" },
+              { text: "FundraiseUp", link: "/supported-sources/fundraiseup.md" },
+              { text: "G2", link: "/supported-sources/g2.md" },
+              { text: "Trustpilot", link: "/supported-sources/trustpilot.md" },
+              { text: "Google Cloud Storage (GCS)", link: "/supported-sources/gcs.md" },
+              { text: "Google Analytics", link: "/supported-sources/google_analytics.md" },
+              { text: "Google Ads", link: "/supported-sources/google-ads.md" },
+              { text: "Google Search Console", link: "/supported-sources/google_search_console.md" },
+              { text: "GitHub", link: "/supported-sources/github.md" },
+              { text: "GitLab", link: "/supported-sources/gitlab.md" },
+              { text: "Google Sheets", link: "/supported-sources/gsheets.md" },
+              { text: "Granola", link: "/supported-sources/granola.md" },
+              { text: "Hostaway", link: "/supported-sources/hostaway.md" },
+              { text: "Indeed", link: "/supported-sources/indeed.md" },
+              { text: "Gorgias", link: "/supported-sources/gorgias.md" },
+              { text: "HubSpot", link: "/supported-sources/hubspot.md" },
+              { text: "Intercom", link: "/supported-sources/intercom.md" },
+              { text: "Internet Society Pulse", link: "/supported-sources/isoc-pulse.md" },
+              { text: "Jira", link: "/supported-sources/jira.md" },
+              { text: "JobTread", link: "/supported-sources/jobtread.md" },
+              { text: "Kalshi", link: "/supported-sources/kalshi.md" },
+              { text: "Klaviyo", link: "/supported-sources/klaviyo.md" },
+              { text: "Linear", link: "/supported-sources/linear.md" },
+              { text: "LinkedIn Ads", link: "/supported-sources/linkedin_ads.md" },
+              { text: "Lumify", link: "/supported-sources/lumify.md" },
+              { text: "Mailchimp", link: "/supported-sources/mailchimp.md" },
+              { text: "Manifold", link: "/supported-sources/manifold.md" },
+              { text: "Mixpanel", link: "/supported-sources/mixpanel.md" },
+              { text: "Monday", link: "/supported-sources/monday.md" },
+              { text: "Notion", link: "/supported-sources/notion.md" },
+              { text: "Okta", link: "/supported-sources/okta.md" },
+              { text: "Paddle", link: "/supported-sources/paddle.md" },
+              { text: "Payrails", link: "/supported-sources/payrails.md" },
+              { text: "Personio", link: "/supported-sources/personio.md" },
+              { text: "PhantomBuster", link: "/supported-sources/phantombuster.md" },
+              { text: "Pinterest", link: "/supported-sources/pinterest.md" },
+              { text: "Pipedrive", link: "/supported-sources/pipedrive.md" },
+              { text: "Polymarket", link: "/supported-sources/polymarket.md" },
+              { text: "PostHog", link: "/supported-sources/posthog.md" },
+              { text: "Primer", link: "/supported-sources/primer.md" },
+              { text: "Plus Vibe AI", link: "/supported-sources/plusvibeai.md" },
+              { text: "QuickBooks", link: "/supported-sources/quickbooks.md" },
+              { text: "Recurly", link: "/supported-sources/recurly.md" },
+              { text: "Reddit Ads", link: "/supported-sources/reddit_ads.md" },
+              { text: "RevenueCat", link: "/supported-sources/revenuecat.md" },
+              { text: "S3", link: "/supported-sources/s3.md" },
+              { text: "Salesforce", link: "/supported-sources/salesforce.md" },
+              { text: "SatisMeter", link: "/supported-sources/satismeter.md" },
+              { text: "SendGrid", link: "/supported-sources/sendgrid.md" },
+              { text: "SFTP", link: "/supported-sources/sftp.md"},
+              { text: "SharePoint", link: "/supported-sources/sharepoint.md" },
+              { text: "Shopify", link: "/supported-sources/shopify.md" },
+              { text: "Sklik", link: "/supported-sources/sklik.md" },
+              { text: "Slack", link: "/supported-sources/slack.md" },
+              { text: "Smartsheet", link: "/supported-sources/smartsheets.md" },
+              { text: "Snapchat Ads", link: "/supported-sources/snapchat-ads.md" },
+              { text: "Solidgate", link: "/supported-sources/solidgate.md" },
+              { text: "Square", link: "/supported-sources/square.md" },
+              { text: "Stripe", link: "/supported-sources/stripe.md" },
+              { text: "Sumble", link: "/supported-sources/sumble.md" },
+              { text: "SurveyMonkey", link: "/supported-sources/surveymonkey.md" },
+              { text: "TikTok Ads", link: "/supported-sources/tiktok-ads.md" },
+              { text: "Trello", link: "/supported-sources/trello.md" },
+              { text: "Twenty CRM", link: "/supported-sources/twenty.md" },
+              { text: "Twilio", link: "/supported-sources/twilio.md" },
+              { text: "2Checkout", link: "/supported-sources/twocheckout.md" },
+              { text: "Typeform", link: "/supported-sources/typeform.md" },
+              { text: "Wise", link: "/supported-sources/wise.md" },
+              { text: "Wistia", link: "/supported-sources/wistia.md" },
+              { text: "Zendesk", link: "/supported-sources/zendesk.md" },
+              { text: "Zoom", link: "/supported-sources/zoom.md" },
+            ],
+          },
+        ],
+      },
+    ],
+
+    socialLinks: [
+      { icon: "github", link: "https://github.com/bruin-data/ingestr" },
+    ],
+  },
+
+});

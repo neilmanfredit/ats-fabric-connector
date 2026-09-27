@@ -1,0 +1,331 @@
+package hubspot
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"strings"
+	"testing"
+
+	httpclient "github.com/bruin-data/ingestr/pkg/http"
+	"github.com/bruin-data/ingestr/pkg/source"
+)
+
+func TestParseHistoryTableName(t *testing.T) {
+	cases := []struct {
+		name      string
+		input     string
+		wantBase  string
+		wantProps []string
+	}{
+		{
+			name:      "non-history unchanged",
+			input:     "contacts",
+			wantBase:  "contacts",
+			wantProps: nil,
+		},
+		{
+			name:      "non-history custom unchanged",
+			input:     "custom:myObj:assoc1,assoc2",
+			wantBase:  "custom:myObj:assoc1,assoc2",
+			wantProps: nil,
+		},
+		{
+			name:      "builtin history no suffix",
+			input:     "property_history:contacts",
+			wantBase:  "property_history:contacts",
+			wantProps: nil,
+		},
+		{
+			name:      "builtin history single prop",
+			input:     "property_history:contacts:email",
+			wantBase:  "property_history:contacts",
+			wantProps: []string{"email"},
+		},
+		{
+			name:      "builtin history multiple props",
+			input:     "property_history:contacts:email,firstname,lastname",
+			wantBase:  "property_history:contacts",
+			wantProps: []string{"email", "firstname", "lastname"},
+		},
+		{
+			name:      "builtin history trailing comma",
+			input:     "property_history:contacts:email,firstname,",
+			wantBase:  "property_history:contacts",
+			wantProps: []string{"email", "firstname"},
+		},
+		{
+			name:      "builtin history whitespace",
+			input:     "property_history:contacts: email , firstname ",
+			wantBase:  "property_history:contacts",
+			wantProps: []string{"email", "firstname"},
+		},
+		{
+			name:      "builtin history empty suffix",
+			input:     "property_history:contacts:",
+			wantBase:  "property_history:contacts",
+			wantProps: nil,
+		},
+		{
+			name:      "custom history no suffix",
+			input:     "property_history:custom:myObj",
+			wantBase:  "property_history:custom:myObj",
+			wantProps: nil,
+		},
+		{
+			name:      "custom history with props",
+			input:     "property_history:custom:myObj:p1,p2",
+			wantBase:  "property_history:custom:myObj",
+			wantProps: []string{"p1", "p2"},
+		},
+		{
+			name:      "custom history only commas",
+			input:     "property_history:custom:myObj:,,,",
+			wantBase:  "property_history:custom:myObj",
+			wantProps: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotBase, gotProps := parseHistoryTableName(tc.input)
+			if gotBase != tc.wantBase {
+				t.Errorf("base: got %q, want %q", gotBase, tc.wantBase)
+			}
+			if !reflect.DeepEqual(gotProps, tc.wantProps) {
+				t.Errorf("props: got %#v, want %#v", gotProps, tc.wantProps)
+			}
+		})
+	}
+}
+
+func TestParseHubspotURI(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:  "api_key",
+			input: "hubspot://?api_key=pat_test_12345",
+			want:  "pat_test_12345",
+		},
+		{
+			name:  "service_key",
+			input: "hubspot://?service_key=sk_test_67890",
+			want:  "sk_test_67890",
+		},
+		{
+			name:  "both equal",
+			input: "hubspot://?api_key=tok&service_key=tok",
+			want:  "tok",
+		},
+		{
+			name:    "both differ",
+			input:   "hubspot://?api_key=a&service_key=b",
+			wantErr: true,
+		},
+		{
+			name:    "missing credential",
+			input:   "hubspot://?",
+			wantErr: true,
+		},
+		{
+			name:    "empty",
+			input:   "hubspot://",
+			wantErr: true,
+		},
+		{
+			name:    "wrong scheme",
+			input:   "postgres://?api_key=x",
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseHubspotURI(tc.input)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil (value %q)", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseTableAssocOverride(t *testing.T) {
+	cases := []struct {
+		name         string
+		input        string
+		wantBase     string
+		wantOverride []string
+		wantOK       bool
+	}{
+		{
+			name:         "no colon",
+			input:        "contacts",
+			wantBase:     "contacts",
+			wantOverride: nil,
+			wantOK:       false,
+		},
+		{
+			name:         "single override",
+			input:        "contacts:companies",
+			wantBase:     "contacts",
+			wantOverride: []string{"companies"},
+			wantOK:       true,
+		},
+		{
+			name:         "multiple overrides",
+			input:        "contacts:companies,deals,tickets",
+			wantBase:     "contacts",
+			wantOverride: []string{"companies", "deals", "tickets"},
+			wantOK:       true,
+		},
+		{
+			name:         "empty override means no associations",
+			input:        "contacts:",
+			wantBase:     "contacts",
+			wantOverride: []string{},
+			wantOK:       true,
+		},
+		{
+			name:         "whitespace trimmed",
+			input:        "contacts: companies , deals ",
+			wantBase:     "contacts",
+			wantOverride: []string{"companies", "deals"},
+			wantOK:       true,
+		},
+		{
+			name:         "trailing comma",
+			input:        "contacts:companies,deals,",
+			wantBase:     "contacts",
+			wantOverride: []string{"companies", "deals"},
+			wantOK:       true,
+		},
+		{
+			name:         "only commas",
+			input:        "contacts:,,,",
+			wantBase:     "contacts",
+			wantOverride: []string{},
+			wantOK:       true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotBase, gotOverride, gotOK := parseTableAssocOverride(tc.input)
+			if gotBase != tc.wantBase {
+				t.Errorf("base: got %q, want %q", gotBase, tc.wantBase)
+			}
+			if !reflect.DeepEqual(gotOverride, tc.wantOverride) {
+				t.Errorf("override: got %#v, want %#v", gotOverride, tc.wantOverride)
+			}
+			if gotOK != tc.wantOK {
+				t.Errorf("ok: got %v, want %v", gotOK, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestFetchAssociationsBatchNumericID(t *testing.T) {
+	cases := []struct {
+		name string
+		id   string
+	}{
+		{name: "plain numeric id", id: "446642248919"},
+		{name: "above javascript safe integer", id: "9007199254740993"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"results":[{"from":{"id":"862245463262"},"to":[{"toObjectId":%s}]}]}`, tc.id)
+			}))
+			defer srv.Close()
+
+			s := &Hubspotsource{client: httpclient.New(httpclient.WithBaseURL(srv.URL))}
+			got, err := s.fetchAssociationsBatch(context.Background(), "contacts", "companies", []string{"862245463262"})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			ids := got["862245463262"]
+			if len(ids) != 1 || ids[0] != tc.id {
+				t.Fatalf("expected [%s], got %#v", tc.id, ids)
+			}
+		})
+	}
+}
+
+func TestHubspotByteCap(t *testing.T) {
+	wide := strings.Repeat("x", 2048)
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		results := []map[string]interface{}{}
+		if calls == 1 {
+			for i := 0; i < 50; i++ {
+				results = append(results, map[string]interface{}{
+					"id": fmt.Sprintf("%d", i),
+					"properties": map[string]interface{}{
+						"hs_object_id": fmt.Sprintf("%d", i),
+						"note":         wide,
+					},
+				})
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"results": results})
+	}))
+	defer srv.Close()
+
+	cfg := tableConfig{ObjectType: "contacts", IncrementalKey: "lastmodifieddate"}
+	props := []string{"hs_object_id", "note"}
+
+	run := func(max int64) (int64, int64) {
+		calls = 0
+		s := &Hubspotsource{searchClient: httpclient.New(httpclient.WithBaseURL(srv.URL))}
+		results := make(chan source.RecordBatchResult, 64)
+		err := s.searchCRMObjects(context.Background(), cfg, props, "0", source.ReadOptions{MaxBatchBytes: max}, results)
+		if err != nil {
+			t.Fatal(err)
+		}
+		close(results)
+		var b, rw int64
+		for res := range results {
+			if res.Err != nil {
+				t.Fatal(res.Err)
+			}
+			b++
+			rw += res.Batch.NumRows()
+			res.Batch.Release()
+		}
+		return b, rw
+	}
+
+	offB, offR := run(0)
+	onB, onR := run(4096)
+	if offB != 1 {
+		t.Fatalf("cap-off batches=%d want 1", offB)
+	}
+	if onB <= 1 {
+		t.Fatalf("cap-on batches=%d want >1", onB)
+	}
+	if offR != onR || offR != 50 {
+		t.Fatalf("row mismatch off=%d on=%d", offR, onR)
+	}
+}

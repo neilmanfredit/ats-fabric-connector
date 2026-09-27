@@ -1,0 +1,279 @@
+package postgres_cdc
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestCaughtUpPositionKeepsItsExactSlot(t *testing.T) {
+	src := NewPostgresCDCSource()
+	src.recordCaughtUpLSN(pglogrepl.LSN(20), "current-slot", true)
+	src.recordCaughtUpLSN(pglogrepl.LSN(10), "stale-slot", false)
+
+	assert.Equal(t, pglogrepl.LSN(20), src.caughtUp.Committed())
+	assert.Equal(t, "current-slot", src.caughtUpSlot)
+	assert.True(t, src.caughtUpFromStream)
+
+	src.recordCaughtUpLSN(pglogrepl.LSN(30), "next-slot", false)
+	assert.Equal(t, pglogrepl.LSN(30), src.caughtUp.Committed())
+	assert.Equal(t, "next-slot", src.caughtUpSlot)
+	assert.False(t, src.caughtUpFromStream)
+}
+
+func TestFinalizeBatchSkipsFreshSnapshotPosition(t *testing.T) {
+	src := NewPostgresCDCSource()
+	src.replConn = &pgconn.PgConn{}
+	src.recordCaughtUpLSN(pglogrepl.LSN(20), "snapshot-slot", false)
+
+	require.NoError(t, src.FinalizeBatch(context.Background()))
+	assert.Equal(t, FormatLSN(pglogrepl.LSN(20)), src.CDCState().Position)
+	assert.Nil(t, src.keepaliveCancel)
+}
+
+func TestSchemes(t *testing.T) {
+	source := NewPostgresCDCSource()
+	schemes := source.Schemes()
+
+	assert.Contains(t, schemes, "postgres+cdc")
+	assert.Contains(t, schemes, "postgresql+cdc")
+	assert.Len(t, schemes, 2)
+}
+
+func TestParseURIConfig(t *testing.T) {
+	tests := []struct {
+		name            string
+		uri             string
+		wantPublication string
+		wantSlot        string
+		wantDestSchema  string
+		wantStateID     string
+		wantBinary      bool
+		wantErr         bool
+	}{
+		{
+			name:            "full config",
+			uri:             "postgres+cdc://user:pass@localhost:5432/mydb?publication=my_pub&slot=my_slot&mode=stream",
+			wantPublication: "my_pub",
+			wantSlot:        "my_slot",
+			wantErr:         false,
+		},
+		{
+			name:            "minimal config",
+			uri:             "postgres+cdc://user:pass@localhost:5432/mydb?publication=my_pub",
+			wantPublication: "my_pub",
+			wantSlot:        "",
+			wantErr:         false,
+		},
+		{
+			name:            "postgresql+cdc scheme",
+			uri:             "postgresql+cdc://user:pass@localhost:5432/mydb?publication=my_pub",
+			wantPublication: "my_pub",
+			wantSlot:        "",
+			wantErr:         false,
+		},
+		{
+			name:            "batch mode explicit",
+			uri:             "postgres+cdc://user:pass@localhost:5432/mydb?publication=my_pub&mode=batch",
+			wantPublication: "my_pub",
+			wantSlot:        "",
+			wantErr:         false,
+		},
+		{
+			name:            "with dest_schema",
+			uri:             "postgres+cdc://user:pass@localhost:5432/mydb?publication=my_pub&dest_schema=my_dataset",
+			wantPublication: "my_pub",
+			wantSlot:        "",
+			wantDestSchema:  "my_dataset",
+			wantErr:         false,
+		},
+		{
+			name:            "with explicit state identity",
+			uri:             "postgres+cdc://user:pass@localhost:5432/mydb?publication=my_pub&state_id=orders-east",
+			wantPublication: "my_pub",
+			wantStateID:     "orders-east",
+		},
+		{
+			name:            "binary opt-in",
+			uri:             "postgres+cdc://user:pass@localhost:5432/mydb?publication=my_pub&binary=true",
+			wantPublication: "my_pub",
+			wantBinary:      true,
+		},
+		{
+			name:            "binary explicit off",
+			uri:             "postgres+cdc://user:pass@localhost:5432/mydb?publication=my_pub&binary=false",
+			wantPublication: "my_pub",
+			wantBinary:      false,
+		},
+		{
+			name:    "binary invalid value",
+			uri:     "postgres+cdc://user:pass@localhost:5432/mydb?publication=my_pub&binary=maybe",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, normalizedURI, err := parseURIConfig(tt.uri)
+
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantPublication, cfg.Publication)
+			assert.Equal(t, tt.wantSlot, cfg.SlotName)
+			assert.Equal(t, tt.wantDestSchema, cfg.DestSchema)
+			assert.Equal(t, tt.wantStateID, cfg.StateID)
+			assert.Equal(t, tt.wantBinary, cfg.Binary)
+
+			// Verify normalized URI doesn't contain CDC params
+			assert.NotContains(t, normalizedURI, "publication=")
+			assert.NotContains(t, normalizedURI, "slot=")
+			assert.NotContains(t, normalizedURI, "mode=")
+			assert.NotContains(t, normalizedURI, "dest_schema=")
+			assert.NotContains(t, normalizedURI, "binary=")
+			assert.NotContains(t, normalizedURI, "state_id=")
+			assert.NotContains(t, normalizedURI, "+cdc")
+		})
+	}
+}
+
+func TestQuotePublicationTables(t *testing.T) {
+	tests := []struct {
+		name   string
+		tables []pgTableRef
+		want   string
+	}{
+		{
+			name:   "single public table",
+			tables: []pgTableRef{{schema: "public", name: "users"}},
+			want:   `"public"."users"`,
+		},
+		{
+			name:   "multiple schemas",
+			tables: []pgTableRef{{schema: "public", name: "users"}, {schema: "app", name: "orders"}},
+			want:   `"public"."users", "app"."orders"`,
+		},
+		{
+			name:   "identifiers needing quoting",
+			tables: []pgTableRef{{schema: "public", name: "Mixed Case"}, {schema: "public", name: `weird"name`}},
+			want:   `"public"."Mixed Case", "public"."weird""name"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, quotePublicationTables(tt.tables))
+		})
+	}
+}
+
+func TestBuildReplicationConnString(t *testing.T) {
+	tests := []struct {
+		name string
+		uri  string
+		want string
+	}{
+		{
+			name: "simple URI",
+			uri:  "postgres://user:pass@localhost:5432/mydb",
+			want: "postgres://user:pass@localhost:5432/mydb?replication=database",
+		},
+		{
+			name: "URI with existing params",
+			uri:  "postgres://user:pass@localhost:5432/mydb?sslmode=disable",
+			want: "postgres://user:pass@localhost:5432/mydb?replication=database&sslmode=disable",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildReplicationConnString(tt.uri)
+			assert.Contains(t, got, "replication=database")
+		})
+	}
+
+	poolURI := buildReplicationConnString("postgres://user:pass@localhost:5432/mydb?pool_max_conns=1&sslmode=disable")
+	assert.NotContains(t, poolURI, "pool_max_conns")
+	assert.Contains(t, poolURI, "sslmode=disable")
+}
+
+func TestCanonicalPublicationTableName(t *testing.T) {
+	// publicationTableFullName leaves public-schema tables unqualified, so both
+	// spellings have to resolve to the same name.
+	tests := []struct {
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{in: "users", want: "users"},
+		{in: "public.users", want: "users"},
+		{in: "sales.orders", want: "sales.orders"},
+		{in: `"Sales"."Orders"`, want: "Sales.Orders"},
+		{in: `"od.d"`, want: "od.d"},
+		{in: "db.public.users", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			got, err := canonicalPublicationTableName(tt.in)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("canonicalPublicationTableName(%q) = %q, want an error", tt.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("canonicalPublicationTableName(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPostgresCDCSelectTables(t *testing.T) {
+	src := &PostgresCDCSource{}
+	if err := src.SelectTables([]string{"public.users", "sales.orders"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The names the source reports are what the selection must match.
+	resolved, err := src.selection.Resolve([]string{"users", "sales.orders", "invoices"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := resolved["users"]; !ok {
+		t.Fatal("expected public.users to match the bare name the source reports")
+	}
+	if _, ok := resolved["sales.orders"]; !ok {
+		t.Fatal("expected sales.orders to match")
+	}
+	if _, ok := resolved["invoices"]; ok {
+		t.Fatal("did not expect an unrequested table to match")
+	}
+
+	if err := src.SelectTables([]string{"users", "public.users"}); err == nil {
+		t.Fatal("expected two spellings of the same table to be rejected")
+	}
+}
+
+func TestSkippedTableReasonText(t *testing.T) {
+	// A requested-but-unpublishable table must explain itself rather than
+	// reporting as simply not found, since the exclusion happens in SQL.
+	unlogged := skippedTable{ref: pgTableRef{schema: "public", name: "scratch"}, reason: skipUnlogged}
+	if got := unlogged.reasonText(); !strings.Contains(got, "unlogged") {
+		t.Fatalf("reasonText = %q, want it to mention unlogged", got)
+	}
+	keyless := skippedTable{ref: pgTableRef{schema: "public", name: "audit"}, reason: skipNoReplicaIdentity}
+	if got := keyless.reasonText(); !strings.Contains(got, "replica identity") {
+		t.Fatalf("reasonText = %q, want it to mention replica identity", got)
+	}
+}

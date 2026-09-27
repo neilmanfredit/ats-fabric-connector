@@ -1,0 +1,866 @@
+package adjust
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/bruin-data/ingestr/internal/config"
+	ingestrhttp "github.com/bruin-data/ingestr/pkg/http"
+	"github.com/bruin-data/ingestr/pkg/schema"
+	"github.com/bruin-data/ingestr/pkg/source"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func timePtr(t time.Time) *time.Time { return &t }
+
+func TestParseAdjustURI(t *testing.T) {
+	tests := []struct {
+		name             string
+		uri              string
+		wantKey          string
+		wantLookBackDays string
+		wantErr          bool
+	}{
+		{
+			name:    "valid URI with api_key only",
+			uri:     "adjust://?api_key=test-key-123",
+			wantKey: "test-key-123",
+		},
+		{
+			name:             "valid URI with api_key and lookback_days",
+			uri:              "adjust://?api_key=my-key&lookback_days=60",
+			wantKey:          "my-key",
+			wantLookBackDays: "60",
+		},
+		{
+			name:    "missing scheme",
+			uri:     "http://?api_key=test-key",
+			wantErr: true,
+		},
+		{
+			name:    "no query params",
+			uri:     "adjust://",
+			wantErr: true,
+		},
+		{
+			name:    "missing api_key",
+			uri:     "adjust://?lookback_days=30",
+			wantErr: true,
+		},
+		{
+			name:    "empty api_key",
+			uri:     "adjust://?api_key=",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			creds, err := parseAdjustURI(tt.uri)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantKey, creds.apiKey)
+			assert.Equal(t, tt.wantLookBackDays, creds.lookBackDays)
+		})
+	}
+}
+
+func TestParseTableSpec(t *testing.T) {
+	tests := []struct {
+		name            string
+		table           string
+		wantBase        string
+		wantAppTokens   string
+		wantAttribution string
+		wantErr         bool
+	}{
+		{name: "no app_token", table: "campaigns", wantBase: "campaigns"},
+		{name: "single token", table: "campaigns:abc123", wantBase: "campaigns", wantAppTokens: "abc123"},
+		{name: "multiple tokens", table: "creatives:abc123,def456", wantBase: "creatives", wantAppTokens: "abc123,def456"},
+		{name: "events with token", table: "events:tok1", wantBase: "events", wantAppTokens: "tok1"},
+		{name: "colon form is app token only", table: "creatives:click", wantBase: "creatives", wantAppTokens: "click"},
+		{name: "query attribution", table: "creatives?attribution_types=click,engaged_ad", wantBase: "creatives", wantAttribution: "click,engaged_ad"},
+		{name: "query token and attribution", table: "creatives?app_token=abc123&attribution_types=click", wantBase: "creatives", wantAppTokens: "abc123", wantAttribution: "click"},
+		{name: "query repeated keys", table: "campaigns?app_token=abc&app_token=def&attribution_types=click&attribution_types=impression", wantBase: "campaigns", wantAppTokens: "abc,def", wantAttribution: "click,impression"},
+		{name: "query unknown key", table: "campaigns?foo=bar", wantErr: true},
+		{name: "custom table untouched", table: "custom:day:installs", wantBase: "custom:day:installs"},
+		{name: "custom with filters untouched", table: "custom:day:installs:app_token__in=abc", wantBase: "custom:day:installs:app_token__in=abc"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base, tokens, attribution, err := parseTableSpec(tt.table)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantBase, base)
+			assert.Equal(t, tt.wantAppTokens, tokens)
+			assert.Equal(t, tt.wantAttribution, attribution)
+		})
+	}
+}
+
+func TestParseCustomTable(t *testing.T) {
+	tests := []struct {
+		name       string
+		table      string
+		wantDims   string
+		wantMets   string
+		wantFilter map[string]string
+		wantErr    bool
+	}{
+		{
+			name:     "valid with day dimension",
+			table:    "custom:day,campaign:installs,clicks",
+			wantDims: "day,campaign",
+			wantMets: "installs,clicks",
+		},
+		{
+			name:       "valid with filters",
+			table:      "custom:day,campaign:installs:app_token=abc123",
+			wantDims:   "day,campaign",
+			wantMets:   "installs",
+			wantFilter: map[string]string{"app_token": "abc123"},
+		},
+		{
+			name:     "valid with hour dimension",
+			table:    "custom:hour:installs",
+			wantDims: "hour",
+			wantMets: "installs",
+		},
+		{
+			name:     "valid with week dimension",
+			table:    "custom:week,country:clicks",
+			wantDims: "week,country",
+			wantMets: "clicks",
+		},
+		{
+			name:     "valid with month dimension",
+			table:    "custom:month:cost",
+			wantDims: "month",
+			wantMets: "cost",
+		},
+		{
+			name:     "valid with quarter dimension",
+			table:    "custom:quarter:installs",
+			wantDims: "quarter",
+			wantMets: "installs",
+		},
+		{
+			name:     "valid with year dimension",
+			table:    "custom:year:installs",
+			wantDims: "year",
+			wantMets: "installs",
+		},
+		{
+			name:    "missing required time dimension",
+			table:   "custom:campaign,country:installs",
+			wantErr: true,
+		},
+		{
+			name:    "empty dimensions",
+			table:   "custom::installs",
+			wantErr: true,
+		},
+		{
+			name:    "empty metrics",
+			table:   "custom:day:",
+			wantErr: true,
+		},
+		{
+			name:    "invalid format - only one part",
+			table:   "custom:day",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dims, mets, filters, err := parseCustomTable(tt.table)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantDims, dims)
+			assert.Equal(t, tt.wantMets, mets)
+			if tt.wantFilter != nil {
+				assert.Equal(t, tt.wantFilter, filters)
+			}
+		})
+	}
+}
+
+func TestParseFilters(t *testing.T) {
+	tests := []struct {
+		name   string
+		raw    string
+		expect map[string]string
+	}{
+		{
+			name:   "single key-value",
+			raw:    "app_token=abc123",
+			expect: map[string]string{"app_token": "abc123"},
+		},
+		{
+			name:   "multiple keys",
+			raw:    "app_token=abc123,country=us",
+			expect: map[string]string{"app_token": "abc123", "country": "us"},
+		},
+		{
+			name:   "multi-value key",
+			raw:    "country=us,gb,de",
+			expect: map[string]string{"country": "us,gb,de"},
+		},
+		{
+			name:   "mixed single and multi-value",
+			raw:    "app_token=abc,country=us,gb,network=facebook",
+			expect: map[string]string{"app_token": "abc", "country": "us,gb", "network": "facebook"},
+		},
+		{
+			name:   "empty string",
+			raw:    "",
+			expect: map[string]string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := parseFilters(tt.raw)
+			assert.Equal(t, tt.expect, result)
+		})
+	}
+}
+
+func TestBuildDatePeriod(t *testing.T) {
+	tests := []struct {
+		name              string
+		lookBackDays      string
+		intervalStart     *time.Time
+		intervalEnd       *time.Time
+		wantContains      []string
+		wantErr           bool
+		wantExpandedStart *time.Time
+	}{
+		{
+			name:              "default lookback of 30 days",
+			lookBackDays:      "",
+			intervalStart:     timePtr(time.Date(2025, 1, 31, 0, 0, 0, 0, time.UTC)),
+			intervalEnd:       timePtr(time.Date(2025, 2, 15, 0, 0, 0, 0, time.UTC)),
+			wantContains:      []string{"2025-01-01", "2025-02-15"},
+			wantExpandedStart: timePtr(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)),
+		},
+		{
+			name:              "custom lookback of 60 days",
+			lookBackDays:      "60",
+			intervalStart:     timePtr(time.Date(2025, 3, 1, 0, 0, 0, 0, time.UTC)),
+			intervalEnd:       timePtr(time.Date(2025, 3, 15, 0, 0, 0, 0, time.UTC)),
+			wantContains:      []string{"2024-12-31", "2025-03-15"},
+			wantExpandedStart: timePtr(time.Date(2024, 12, 31, 0, 0, 0, 0, time.UTC)),
+		},
+		{
+			name:              "lookback with time.Time interval",
+			lookBackDays:      "10",
+			intervalStart:     timePtr(time.Date(2025, 1, 20, 0, 0, 0, 0, time.UTC)),
+			intervalEnd:       timePtr(time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)),
+			wantContains:      []string{"2025-01-10", "2025-02-01"},
+			wantExpandedStart: timePtr(time.Date(2025, 1, 10, 0, 0, 0, 0, time.UTC)),
+		},
+		{
+			name:         "no interval defaults to now minus lookback_days",
+			lookBackDays: "30",
+			wantContains: []string{":"},
+		},
+		{
+			name:          "start after end returns error",
+			lookBackDays:  "0",
+			intervalStart: timePtr(time.Date(2025, 3, 1, 0, 0, 0, 0, time.UTC)),
+			intervalEnd:   timePtr(time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)),
+			wantErr:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &AdjustSource{lookBackDays: tt.lookBackDays}
+			opts := &source.ReadOptions{
+				IntervalStart: tt.intervalStart,
+				IntervalEnd:   tt.intervalEnd,
+			}
+			result, err := s.buildDatePeriod(opts)
+
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+
+			assert.NoError(t, err)
+			for _, want := range tt.wantContains {
+				assert.Contains(t, result, want)
+			}
+
+			if tt.wantExpandedStart != nil {
+				assert.Equal(t, *tt.wantExpandedStart, *opts.IntervalStart, "IntervalStart should be expanded by lookback days")
+			}
+		})
+	}
+}
+
+func TestSplitDatePeriodByDay(t *testing.T) {
+	tests := []struct {
+		name       string
+		datePeriod string
+		want       []string
+		wantErr    bool
+	}{
+		{
+			name:       "multi-day period",
+			datePeriod: "2025-01-01:2025-01-03",
+			want: []string{
+				"2025-01-01:2025-01-01",
+				"2025-01-02:2025-01-02",
+				"2025-01-03:2025-01-03",
+			},
+		},
+		{
+			name:       "single-day period",
+			datePeriod: "2025-01-01:2025-01-01",
+			want:       []string{"2025-01-01:2025-01-01"},
+		},
+		{name: "missing separator", datePeriod: "2025-01-01", wantErr: true},
+		{name: "invalid start", datePeriod: "bad:2025-01-01", wantErr: true},
+		{name: "start after end", datePeriod: "2025-01-02:2025-01-01", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := splitDatePeriodByDay(tt.datePeriod)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestHasDailyDimension(t *testing.T) {
+	assert.True(t, hasDailyDimension("campaign,day,creative"))
+	assert.True(t, hasDailyDimension("hour,campaign"))
+	assert.False(t, hasDailyDimension("campaign,week"))
+	assert.False(t, hasDailyDimension("month"))
+}
+
+func TestReportWorkerCount(t *testing.T) {
+	tests := []struct {
+		name        string
+		parallelism int
+		periodCount int
+		want        int
+	}{
+		{name: "source default", parallelism: 0, periodCount: 7, want: config.DefaultExtractParallelism},
+		{name: "global default", parallelism: config.DefaultExtractParallelism, periodCount: 7, want: config.DefaultExtractParallelism},
+		{name: "sequential", parallelism: 1, periodCount: 7, want: 1},
+		{name: "unbounded by source", parallelism: 6, periodCount: 7, want: 6},
+		{name: "bounded by periods", parallelism: 8, periodCount: 7, want: 7},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, reportWorkerCount(tt.parallelism, tt.periodCount))
+		})
+	}
+}
+
+func TestReadCreativesSplitsMultiDayReports(t *testing.T) {
+	requests := make(chan url.Values, 3)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.URL.Query()
+		datePeriod := r.URL.Query().Get("date_period")
+		day, _, _ := strings.Cut(datePeriod, ":")
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{
+			"rows": []map[string]interface{}{{
+				"campaign":     "campaign-1",
+				"day":          day,
+				"app":          "app-1",
+				"app_token":    "token-1",
+				"store_type":   "google_play",
+				"channel":      "channel-1",
+				"country":      "TR",
+				"adgroup":      "adgroup-1",
+				"creative":     "creative-1",
+				"installs":     "1",
+				"network_cost": "2.5",
+			}},
+		}); err != nil {
+			t.Errorf("failed to encode test response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	s := &AdjustSource{
+		lookBackDays: "0",
+		client:       ingestrhttp.New(ingestrhttp.WithBaseURL(server.URL)),
+	}
+	defer func() {
+		require.NoError(t, s.client.Close())
+	}()
+
+	start := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2025, 1, 3, 0, 0, 0, 0, time.UTC)
+	results := make(chan source.RecordBatchResult, 3)
+	err := s.readCreatives(context.Background(), "token-1", "", source.ReadOptions{
+		IntervalStart: &start,
+		IntervalEnd:   &end,
+	}, results)
+	require.NoError(t, err)
+	close(results)
+	close(requests)
+
+	var periods []string
+	for query := range requests {
+		periods = append(periods, query.Get("date_period"))
+		assert.Equal(t, defaultAttributionTypes, query.Get("attribution_types"))
+		assert.Equal(t, "token-1", query.Get("app_token__in"))
+	}
+	assert.ElementsMatch(t, []string{
+		"2025-01-01:2025-01-01",
+		"2025-01-02:2025-01-02",
+		"2025-01-03:2025-01-03",
+	}, periods)
+
+	batchCount := 0
+	for result := range results {
+		require.NoError(t, result.Err)
+		require.NotNil(t, result.Batch)
+		assert.Equal(t, int64(1), result.Batch.NumRows())
+		result.Batch.Release()
+		batchCount++
+	}
+	assert.Equal(t, 3, batchCount)
+}
+
+func TestReadCreativesHonorsConfiguredConcurrency(t *testing.T) {
+	const parallelism = 6
+
+	started := make(chan struct{}, parallelism)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	var requestCount atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			maximum := maxActive.Load()
+			if current <= maximum || maxActive.CompareAndSwap(maximum, current) {
+				break
+			}
+		}
+
+		started <- struct{}{}
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"rows":[]}`))
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+	})
+
+	s := &AdjustSource{
+		lookBackDays: "0",
+		client:       ingestrhttp.New(ingestrhttp.WithBaseURL(server.URL)),
+	}
+	t.Cleanup(func() {
+		require.NoError(t, s.client.Close())
+	})
+
+	start := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2025, 1, parallelism, 0, 0, 0, 0, time.UTC)
+	results := make(chan source.RecordBatchResult, parallelism)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.readCreatives(context.Background(), "", "", source.ReadOptions{
+			IntervalStart: &start,
+			IntervalEnd:   &end,
+			Parallelism:   parallelism,
+		}, results)
+	}()
+
+	for range parallelism {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for concurrent Adjust requests")
+		}
+	}
+	releaseOnce.Do(func() { close(release) })
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for concurrent Adjust requests to finish")
+	}
+	assert.Equal(t, int32(parallelism), requestCount.Load())
+	assert.Equal(t, int32(parallelism), maxActive.Load())
+}
+
+func TestReadCreativesCancelsConcurrentRequestsAfterError(t *testing.T) {
+	secondRequestStarted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("date_period") == "2025-01-01:2025-01-01" {
+			<-secondRequestStarted
+			http.Error(w, "invalid report", http.StatusBadRequest)
+			return
+		}
+
+		close(secondRequestStarted)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	s := &AdjustSource{
+		lookBackDays: "0",
+		client:       ingestrhttp.New(ingestrhttp.WithBaseURL(server.URL)),
+	}
+	defer func() {
+		require.NoError(t, s.client.Close())
+	}()
+
+	start := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
+	results := make(chan source.RecordBatchResult, 2)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	err := s.readCreatives(ctx, "", "", source.ReadOptions{
+		IntervalStart: &start,
+		IntervalEnd:   &end,
+	}, results)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "status 400")
+}
+
+func TestReadCustomDoesNotSplitCoarseTimeDimensions(t *testing.T) {
+	requests := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.URL.Query().Get("date_period")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"rows":[]}`))
+	}))
+	defer server.Close()
+
+	s := &AdjustSource{
+		lookBackDays: "0",
+		client:       ingestrhttp.New(ingestrhttp.WithBaseURL(server.URL)),
+	}
+	defer func() {
+		require.NoError(t, s.client.Close())
+	}()
+
+	start := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2025, 1, 3, 0, 0, 0, 0, time.UTC)
+	results := make(chan source.RecordBatchResult)
+	err := s.readCustom(context.Background(), "custom:month,campaign:installs", "", source.ReadOptions{
+		IntervalStart: &start,
+		IntervalEnd:   &end,
+	}, results)
+	require.NoError(t, err)
+	assert.Equal(t, "2025-01-01:2025-01-03", <-requests)
+}
+
+func TestBuildTypeHintColumns(t *testing.T) {
+	tests := []struct {
+		name       string
+		dimensions string
+		metrics    string
+		wantCols   []schema.Column
+	}{
+		{
+			name:       "known dimensions and metrics",
+			dimensions: "day,campaign",
+			metrics:    "installs,cost",
+			wantCols: []schema.Column{
+				{Name: "day", DataType: schema.TypeDate, Nullable: true},
+				{Name: "campaign", DataType: schema.TypeString, Nullable: true},
+				{Name: "installs", DataType: schema.TypeInt64, Nullable: true},
+				{Name: "cost", DataType: schema.TypeDecimal, Precision: 38, Scale: 9, Nullable: true},
+			},
+		},
+		{
+			name:       "hour dimension",
+			dimensions: "hour",
+			metrics:    "clicks",
+			wantCols: []schema.Column{
+				{Name: "hour", DataType: schema.TypeTimestampTZ, Nullable: true},
+				{Name: "clicks", DataType: schema.TypeInt64, Nullable: true},
+			},
+		},
+		{
+			name:       "unknown fields are skipped",
+			dimensions: "day,unknown_dim",
+			metrics:    "installs,unknown_metric",
+			wantCols: []schema.Column{
+				{Name: "day", DataType: schema.TypeDate, Nullable: true},
+				{Name: "installs", DataType: schema.TypeInt64, Nullable: true},
+			},
+		},
+		{
+			name:       "all unknown returns empty",
+			dimensions: "foo",
+			metrics:    "bar",
+			wantCols:   nil,
+		},
+		{
+			name:       "default campaign dimensions are typed",
+			dimensions: "app,app_token,store_type,channel,country",
+			metrics:    "",
+			wantCols: []schema.Column{
+				{Name: "app", DataType: schema.TypeString, Nullable: true},
+				{Name: "app_token", DataType: schema.TypeString, Nullable: true},
+				{Name: "store_type", DataType: schema.TypeString, Nullable: true},
+				{Name: "channel", DataType: schema.TypeString, Nullable: true},
+				{Name: "country", DataType: schema.TypeString, Nullable: true},
+			},
+		},
+		{
+			name:       "revenue cohort metrics are decimal by prefix",
+			dimensions: "",
+			metrics:    "all_revenue_total_d0,ad_revenue_total_d21,revenue_total_d120",
+			wantCols: []schema.Column{
+				{Name: "all_revenue_total_d0", DataType: schema.TypeDecimal, Precision: 38, Scale: 9, Nullable: true},
+				{Name: "ad_revenue_total_d21", DataType: schema.TypeDecimal, Precision: 38, Scale: 9, Nullable: true},
+				{Name: "revenue_total_d120", DataType: schema.TypeDecimal, Precision: 38, Scale: 9, Nullable: true},
+			},
+		},
+		{
+			name:       "prefix match requires a numeric cohort-day suffix",
+			dimensions: "",
+			metrics:    "revenue_total_daily,ad_revenue_total_d,all_revenue_total_d7x",
+			wantCols:   nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cols := buildTypeHintColumns(tt.dimensions, tt.metrics)
+			assert.Equal(t, tt.wantCols, cols)
+		})
+	}
+}
+
+func TestBuildDefaultMetrics(t *testing.T) {
+	metrics := buildDefaultMetrics()
+
+	assert.Equal(t, []string{"installs", "network_cost"}, metrics[:2])
+
+	// Every cohort day must have all three revenue variants (D21 used to be
+	// asymmetric — only all_revenue_total_d21 was present).
+	for _, day := range revenueCohortDays {
+		for _, prefix := range revenueMetricPrefixes {
+			assert.Contains(t, metrics, prefix+strconv.Itoa(day))
+		}
+	}
+
+	assert.Contains(t, metrics, "revenue_total_d120")
+	assert.Contains(t, metrics, "ad_revenue_total_d120")
+	assert.Contains(t, metrics, "all_revenue_total_d120")
+
+	// Every metric must resolve to a type hint so no column falls back to
+	// schema inference.
+	for _, m := range metrics {
+		_, ok := lookupTypeHint(m)
+		assert.Truef(t, ok, "metric %q has no type hint", m)
+	}
+}
+
+func TestIsValidTable(t *testing.T) {
+	tests := []struct {
+		name  string
+		table string
+		valid bool
+	}{
+		{"events", "events", true},
+		{"campaigns", "campaigns", true},
+		{"creatives", "creatives", true},
+		{"custom prefix", "custom:day:installs", true},
+		{"custom bare", "custom", false},
+		{"unsupported", "unknown_table", false},
+		{"empty", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.valid, isValidTable(tt.table))
+		})
+	}
+}
+
+func TestGetTable_CustomMergeKeyPriority(t *testing.T) {
+	s := NewAdjustSource()
+
+	tests := []struct {
+		name         string
+		table        string
+		wantMergeKey string
+		wantPKs      []string
+	}{
+		{
+			name:         "hour has highest priority",
+			table:        "custom:year,hour,day:installs",
+			wantMergeKey: "hour",
+			wantPKs:      []string{"year", "hour", "day"},
+		},
+		{
+			name:         "day is second priority",
+			table:        "custom:year,day,campaign:installs",
+			wantMergeKey: "day",
+			wantPKs:      []string{"year", "day", "campaign"},
+		},
+		{
+			name:         "week is third priority",
+			table:        "custom:week,campaign:installs",
+			wantMergeKey: "week",
+			wantPKs:      []string{"week", "campaign"},
+		},
+		{
+			name:         "single required dimension",
+			table:        "custom:month:clicks",
+			wantMergeKey: "month",
+			wantPKs:      []string{"month"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			table, err := s.GetTable(context.Background(), source.TableRequest{Name: tt.table})
+			require.NoError(t, err)
+
+			dst := table.(*source.DynamicSourceTable)
+			assert.Equal(t, tt.wantMergeKey, dst.TableIncrementalKey)
+			assert.Equal(t, tt.wantPKs, dst.TablePrimaryKeys)
+			assert.Equal(t, config.StrategyDeleteInsert, dst.TableStrategy)
+		})
+	}
+}
+
+func TestGetTable_Strategies(t *testing.T) {
+	s := NewAdjustSource()
+
+	tests := []struct {
+		name     string
+		table    string
+		strategy config.IncrementalStrategy
+		wantPKs  []string
+		wantKey  string
+	}{
+		{"events is replace", "events", config.StrategyReplace, []string{"id"}, ""},
+		{"campaigns is merge", "campaigns", config.StrategyMerge, defaultPrimaryKeys, "day"},
+		{"creatives is merge", "creatives", config.StrategyMerge, creativePrimaryKeys, "day"},
+		{"custom is delete-insert", "custom:day:installs", config.StrategyDeleteInsert, []string{"day"}, "day"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			table, err := s.GetTable(context.Background(), source.TableRequest{Name: tt.table})
+			require.NoError(t, err)
+			dst := table.(*source.DynamicSourceTable)
+			assert.Equal(t, tt.strategy, dst.TableStrategy)
+			assert.Equal(t, tt.wantPKs, dst.TablePrimaryKeys)
+			assert.Equal(t, tt.wantKey, dst.TableIncrementalKey)
+		})
+	}
+}
+
+func TestGetTable_AttributionTypesGuard(t *testing.T) {
+	s := NewAdjustSource()
+
+	tests := []struct {
+		name    string
+		table   string
+		wantErr bool
+	}{
+		{"campaigns accepts attribution_types", "campaigns?attribution_types=click", false},
+		{"creatives accepts attribution_types", "creatives?attribution_types=click,engaged_ad", false},
+		{"events rejects attribution_types", "events?attribution_types=click", true},
+		{"events still accepts app_token", "events?app_token=abc123", false},
+		{"unknown attribution_types value is left to Adjust", "campaigns?attribution_types=impresion", false},
+		{"custom accepts attribution_types via filters", "custom:day,campaign:installs:attribution_types=click,engaged_ad", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := s.GetTable(context.Background(), source.TableRequest{Name: tt.table})
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestAdjustByteCap(t *testing.T) {
+	wide := strings.Repeat("x", 2048)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rows := []map[string]interface{}{}
+		for i := 0; i < 50; i++ {
+			rows = append(rows, map[string]interface{}{"id": i, "name": wide})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(rows)
+	}))
+	defer srv.Close()
+
+	run := func(max int64) (int64, int64) {
+		s := &AdjustSource{client: ingestrhttp.New(ingestrhttp.WithBaseURL(srv.URL))}
+		results, err := s.read(context.Background(), "events", "", "", source.ReadOptions{MaxBatchBytes: max})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var b, rw int64
+		for res := range results {
+			if res.Err != nil {
+				t.Fatal(res.Err)
+			}
+			b++
+			rw += res.Batch.NumRows()
+			res.Batch.Release()
+		}
+		return b, rw
+	}
+
+	offB, offR := run(0)
+	onB, onR := run(4096)
+	if offB != 1 {
+		t.Fatalf("cap-off batches=%d want 1", offB)
+	}
+	if onB <= 1 {
+		t.Fatalf("cap-on batches=%d want >1", onB)
+	}
+	if offR != onR || offR != 50 {
+		t.Fatalf("row mismatch off=%d on=%d", offR, onR)
+	}
+}

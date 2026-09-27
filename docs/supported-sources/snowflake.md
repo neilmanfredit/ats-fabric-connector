@@ -1,0 +1,99 @@
+# Snowflake
+Snowflake is a cloud-based data warehousing platform that supports structured and semi-structured data.
+
+ingestr supports Snowflake as both a source and destination.
+
+## URI format
+The URI format for Snowflake is as follows:
+
+```plaintext
+snowflake://user:password@account/dbname?warehouse=COMPUTE_WH&role=data_scientist
+```
+
+URI parameters:
+- `user`: the user name to connect to the database
+- `password`: the password for the user
+- `account`: your Snowflake account identifier (copying from snowflake interface gives you org_name.account_name, modify the "." to "-" in the ingestr command)
+- `dbname`: the name of the database to connect to
+- `warehouse`: optional, the name of the warehouse to use
+- `role`: optional, the name of the role to use
+
+The same URI structure can be used both for sources and destinations. You can read more about SQLAlchemy's Snowflake dialect [here](https://docs.snowflake.com/en/developer-guide/python-connector/sqlalchemy#connection-parameters).
+
+## Key-Pair Authentication
+
+Snowflake supports key-pair (JWT) authentication as an alternative to password-based authentication. To use it, pass the private key via the `private_key` query parameter instead of a password:
+
+```plaintext
+snowflake://user@account/dbname?warehouse=COMPUTE_WH&role=data_scientist&private_key=<private-key>
+```
+
+If your private key is encrypted with a passphrase, add the `private_key_passphrase` parameter:
+
+```plaintext
+snowflake://user@account/dbname?private_key=<key>&private_key_passphrase=<passphrase>
+```
+
+### Setting up key-pair authentication
+
+#### Step 1: Generate a key pair
+
+Open your terminal and run the following command to create a key pair. If you're using a mac, OpenSSL should be installed by default, so no additional setup is required. For Linux or Windows, you may need to [install OpenSSL first](https://docs.openssl.org/3.4/man7/ossl-guide-introduction/).
+
+```bash
+openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out rsa_key.p8 -nocrypt
+openssl pkey -in rsa_key.p8 -pubout -out rsa_key.pub
+```
+
+#### Step 2: Set public key for Snowflake user
+
+Log into Snowflake as an admin, create a new worksheet and run the following command (don't forget the single quotes around the key):
+
+```sql
+ALTER USER your_snowflake_username
+SET RSA_PUBLIC_KEY='your_public_key_here';
+```
+
+#### Step 3: Verify
+
+```sql
+DESC USER your_snowflake_username;
+```
+
+This will show a column named `RSA_PUBLIC_KEY`. You should see your actual key there.
+
+#### Step 4: Use the private key in the URI
+
+The private key must be URL-encoded when passed as a URI parameter. You can do this directly from the PEM file:
+
+```bash
+KEY=$(python3 -c "import urllib.parse; print(urllib.parse.quote(open('rsa_key.p8').read().strip()))")
+
+ingestr ingest \
+  --source-uri="snowflake://USER@account/dbname?warehouse=WH&role=ROLE&private_key=$KEY" \
+  --source-table="schema.table_name" \
+  --dest-uri="duckdb:///path/to/output.duckdb" \
+  --dest-table="main.table_name"
+```
+
+For more details on how to set up key-based authentication, see [this guide](https://select.dev/docs/snowflake-developer-guide/snowflake-key-pair).
+
+## Destination-managed Postgres CDC state
+
+When Snowflake is used as a Postgres CDC destination (`postgres+cdc://` → `snowflake://`), ingestr stores resume progress in shared destination tables rather than relying on `MAX(_cdc_lsn)` in user tables:
+
+- `_BRUIN_STAGING.CDC_STATE` — append-only connector state events (run/snapshot/checkpoint)
+- `_BRUIN_STAGING.CDC_TARGETS` — ownership claims for destination tables
+
+These tables live in the connected Snowflake database (the catalog from the URI). Snowflake also supports CDC merge with unchanged-TOAST / `_cdc_unchanged_cols` preservation for Postgres `JSONB` and other TOASTed columns under `REPLICA IDENTITY DEFAULT`.
+
+## Tuning the write path
+
+When Snowflake is the destination, ingestr coalesces record batches into larger Parquet files, uploads them to the table's implicit stage, and loads them with `COPY INTO`. Two environment variables tune that path; neither is normally needed.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `INGESTR_SNOWFLAKE_FILE_SIZE_MB` | `32` | Compressed size at which a worker closes the current file and uploads it. Larger files amortize the per-upload overhead; smaller ones lower memory use. `0` uploads one file per record batch. Values above `1024` are clamped. |
+| `INGESTR_SNOWFLAKE_PARQUET_CODEC` | `zstd` | Parquet compression codec. `snappy` and `gzip` are also accepted; anything else falls back to `zstd`. |
+
+Each worker buffers up to one file in memory, so peak usage scales with `--extract-parallelism` and, for multi-table ingestions, with the number of tables. ingestr tracks the combined buffer across all concurrent workers and closes files early once it exceeds roughly 256 MiB. That is a soft limit checked between record batches, not a hard cap, and it does not cover the extra copy the Snowflake driver makes while a file is uploading, so plan for roughly twice that figure. Lower `INGESTR_SNOWFLAKE_FILE_SIZE_MB` if memory is tight.

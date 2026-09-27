@@ -1,0 +1,238 @@
+# Google Cloud Storage
+
+[Google Cloud Storage](https://cloud.google.com/storage?hl=en) is an online file storage web service for storing and accessing data on Google Cloud Platform infrastructure. The service combines the performance and scalability of Google's cloud with advanced security and sharing capabilities. It is an Infrastructure as a Service (IaaS), comparable to Amazon S3.
+
+`ingestr` supports Google Cloud Storage as both a data source and destination.
+
+## URI format
+
+The URI format for Google Cloud Storage is as follows:
+
+```plaintext
+gs://?credentials_path=/path/to/service-account.json
+```
+
+URI parameters:
+
+- `credentials_path`: path to file containing your Google Cloud [Service Account](https://cloud.google.com/iam/docs/service-account-overview)
+- `credentials_base64`: base64-encoded service account JSON (alternative to credentials_path)
+- `layout`: Layout template (optional, destination only)
+
+The `--source-table` must be in the format:
+```
+{bucket name}/{file glob}
+```
+
+## Setting up a GCS Integration
+
+To use Google Cloud Storage source in `ingestr`, you will need:
+* A Google Cloud Project.
+* A Service Account with at least [roles/storage.objectUser](https://cloud.google.com/storage/docs/access-control/iam-roles) IAM permission for reading, or [roles/storage.objectAdmin](https://cloud.google.com/storage/docs/access-control/iam-roles) for writing to GCS.
+* A Service Account key file for the corresponding service account.
+
+For more information on how to create a Service Account or its keys, see [Create service accounts](https://cloud.google.com/iam/docs/service-accounts-create) and [Create or delete service account keys](https://cloud.google.com/iam/docs/keys-create-delete) on Google Cloud docs.
+
+## Example: Loading data from GCS
+
+Let's assume that:
+* Service account key is available in the current directory, under the filename `service_account.json`. 
+* The bucket you want to load data from is called `my-org-bucket`
+* The source file is available at `data/latest/dump.csv`
+* The data needs to be saved in a DuckDB database called `local.db`
+* The destination table name will be `public.latest_dump`
+
+You can run the following command line to achieve this:
+
+```sh
+ingestr ingest \
+    --source-uri "gs://?credentials_path=$PWD/service_account.json" \
+    --source-table "my-org-bucket/data/latest/dump.csv" \
+    --dest-uri "duckdb:///local.db" \
+    --dest-table "public.latest_dump"
+```
+
+## Example: Uploading data to GCS
+
+For this example, we'll assume that:
+* `records.db` is a DuckDB database.
+* It has a table called `public.users`.
+* The service account key is available in the current directory.
+
+The following command demonstrates how to copy data from a local DuckDB database to GCS:
+```sh
+ingestr ingest \
+    --source-uri 'duckdb:///records.db' \
+    --source-table 'public.users' \
+    --dest-uri "gs://?credentials_path=$PWD/service_account.json" \
+    --dest-table 'my-org-bucket/records'
+```
+
+This will result in a file structure like the following:
+```
+my-org-bucket/
+└── records
+    └── <load_id>.<file_id>.parquet
+```
+
+The value of `load_id` and `file_id` is determined at runtime. The default layout writes the data as one or more parquet files named `<load_id>.<file_id>.parquet` under the destination path. This layout is configurable using the `layout` parameter.
+
+For example, if you would like to write a parquet file named after the destination table instead, you can set `layout` to `{table_name}.{ext}` in the command line above:
+
+```sh
+ingestr ingest \
+    --source-uri 'duckdb:///records.db' \
+    --source-table 'public.users' \
+    --dest-uri "gs://?layout={table_name}.{ext}&credentials_path=$PWD/service_account.json" \
+    --dest-table 'my-org-bucket/records'
+```
+
+Result:
+```
+my-org-bucket/
+└── records
+    └── records.parquet
+```
+
+### Available Layout Placeholders
+
+The following placeholders can be used in the `layout` parameter:
+
+| Placeholder | Description |
+|-------------|-------------|
+| `{table_name}` | Name of the table being written |
+| `{load_id}` | Unique identifier for the current load operation |
+| `{file_id}` | Unique identifier for each file within a load |
+| `{ext}` | File extension (`parquet`) |
+
+Example layouts:
+- `{load_id}.{file_id}.{ext}` - Default layout
+- `{table_name}/{load_id}.{file_id}.{ext}` - Organized by table name
+- `{table_name}.{ext}` - Single file per table
+
+## Supported File Formats
+`gs` source only supports loading files in the following formats:
+* `csv`: Comma Separated Values with headers
+* `csv_headless`: CSV files without headers (use `#csv_headless` suffix)
+* `parquet`: [Apache Parquet](https://parquet.apache.org/) storage format.
+* `jsonl`: Line delimited JSON. see [https://jsonlines.org/](https://jsonlines.org/)
+
+::: info NOTE
+When writing to GCS, only `parquet` is supported.
+:::
+## File Pattern
+`ingestr` supports [glob](https://en.wikipedia.org/wiki/Glob_(programming)) like pattern matching for `gs` source.
+This allows for a powerful pattern matching mechanism that allows you to specify multiple files in a single `--source-table`.
+
+Below are some examples of path patterns, each path pattern is glob you can specify after the bucket name:
+
+- `**/*.csv`: Retrieves all the CSV files, regardless of how deep they are within the folder structure.
+- `*.csv`: Retrieves all the CSV files from the first level of a folder.
+- `myFolder/**/*.jsonl`: Retrieves all the JSONL files from anywhere under `myFolder`.
+- `myFolder/mySubFolder/users.parquet`: Retrieves the `users.parquet` file from `mySubFolder`.
+- `employees.jsonl`: Retrieves the `employees.jsonl` file from the root level of the bucket.
+
+### Working with compressed files
+
+`ingestr` automatically detects and handles gzipped files in your GCS bucket. You can load data from compressed files with the `.gz` extension without any additional configuration.
+
+For example, to load data from a gzipped CSV file:
+
+```sh
+ingestr ingest \
+    --source-uri "gs://?credentials_path=$PWD/service_account.json" \
+    --source-table "my-org-bucket/logs/event-data.csv.gz" \
+    --dest-uri "duckdb:///compressed_data.duckdb" \
+    --dest-table "logs.events"
+```
+
+You can also use glob patterns to load multiple compressed files:
+
+```sh
+ingestr ingest \
+    --source-uri "gs://?credentials_path=$PWD/service_account.json" \
+    --source-table "my-org-bucket/logs/**/*.csv.gz" \
+    --dest-uri "duckdb:///compressed_data.duckdb" \
+    --dest-table "logs.events"
+```
+
+To read files inside a ZIP archive, append `!<member-glob>` to the object path. For example, `my-org-bucket/releases/*.zip!**/*.csv` selects every CSV member from each matching ZIP object. CSV, JSONL/NDJSON, and parquet members are supported; a format hint can follow the member glob when names have no useful extension, such as `release.zip!data/*#jsonl`.
+
+ZIP objects use temporary spooling.
+
+### File type hinting
+
+If your files are properly encoded but lack the correct file extension (CSV, JSONL, or Parquet), you can provide a file type hint to inform `ingestr` about the format of the files. This is done by appending a fragment identifier (`#format`) to the end of the path in your `--source-table` parameter.
+
+For example, if you have JSONL-formatted log files stored in GCS with a non-standard extension:
+
+```
+--source-table "my-org-bucket/logs/event-data#jsonl"
+```
+
+This tells `ingestr` to process the files as JSONL, regardless of their actual extension.
+
+Supported format hints include:
+- `#csv` - For comma-separated values files with headers
+- `#csv_headless` - For CSV files without headers
+- `#jsonl` - For line-delimited JSON files
+- `#parquet` - For Parquet format files
+
+::: tip
+File type hinting works with `gzip` compressed files and ZIP archive members as well.
+:::
+
+### Incremental loading by source file timestamps
+
+When GCS is used as a source, ingestr can use the GCS object `Updated` or `Created` timestamp as the incremental key. This filters matching objects before they are downloaded, so only files inside the requested timestamp interval are read.
+
+This mode is opt-in for backward compatibility. Existing GCS ingestions without `--incremental-key _ingestr_source_file_modified_at` or `--incremental-key _ingestr_source_file_created_at` keep the previous schema and file-listing behavior.
+
+When enabled, the source adds the selected timestamp column and the source file path to every emitted row:
+
+- `_ingestr_source_file_modified_at`: the GCS object `Updated` timestamp in UTC.
+- `_ingestr_source_file_created_at`: the GCS object `Created` timestamp in UTC.
+- `_ingestr_source_file_path`: the full `gs://bucket/key` path for the source object.
+
+Use `--incremental-key _ingestr_source_file_modified_at` or `--incremental-key _ingestr_source_file_created_at` to select this mode. Other `--incremental-key` values are treated as regular columns from the file data for destination write strategies. They do not enable GCS object timestamp filtering, add file metadata columns, or filter rows while reading the files.
+
+Use `--interval-start` and optionally `--interval-end` to load only objects whose selected timestamp is in that window:
+
+```sh
+ingestr ingest \
+    --source-uri "gs://?credentials_path=$PWD/service_account.json" \
+    --source-table "my-org-bucket/logs/**/*.jsonl" \
+    --dest-uri "duckdb:///logs.duckdb" \
+    --dest-table "logs.events" \
+    --incremental-strategy append \
+    --incremental-key _ingestr_source_file_modified_at \
+    --interval-start "2026-01-01T00:00:00Z"
+```
+
+The interval bounds are compared to the selected GCS object timestamp, not row values inside the files. The interval is half-open: `--interval-start` is inclusive, and `--interval-end` is exclusive. If no interval is provided, ingestr reads all files matching the source-table pattern and still emits the selected metadata columns.
+
+The `_ingestr_source_file_modified_at`, `_ingestr_source_file_created_at`, and `_ingestr_source_file_path` column names must not already exist in the files when they are emitted. Use `--exclude-columns` only if you intentionally want to suppress one of these emitted metadata columns; excluding the selected timestamp column also means it will not be available to destination strategies as an incremental key.
+
+### CSV files without headers
+
+For CSV files that don't have a header row, use the `#csv_headless` format hint. You can optionally provide column names using the `--columns` flag:
+
+```sh
+# With custom column names
+ingestr ingest \
+    --source-uri "gs://?credentials_path=$PWD/service_account.json" \
+    --source-table "my-org-bucket/data/raw-data.csv#csv_headless" \
+    --columns "id:bigint,name:text,value:double" \
+    --dest-uri "duckdb:///local.db" \
+    --dest-table "public.raw_data"
+```
+
+If no column names are provided, columns will be automatically named `unknown_col_0`, `unknown_col_1`, etc.:
+
+```sh
+# Without column names (auto-generated)
+ingestr ingest \
+    --source-uri "gs://?credentials_path=$PWD/service_account.json" \
+    --source-table "my-org-bucket/data/raw-data.csv#csv_headless" \
+    --dest-uri "duckdb:///local.db" \
+    --dest-table "public.raw_data"
+```

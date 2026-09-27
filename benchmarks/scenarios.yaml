@@ -1,0 +1,246 @@
+defaults:
+  rows: 10000000
+  runs: 5
+  warmup: 1
+
+sources:
+  local_kafka:
+    type: kafka
+    uri: "kafka://?bootstrap_servers=localhost:9094&group_id=ingestr-benchmark"
+    table: "bench_data_json_{size}"
+    docker: bench-kafka-source
+    seed: true
+
+  local_postgres:
+    type: postgres
+    uri: "postgres://bench_user:bench_pass@localhost:5440/bench_source?sslmode=disable"
+    table: "public.bench_data_{size}"
+    docker: bench-pg-source
+    seed: true
+
+  local_mysql:
+    type: mysql
+    uri: "mysql://bench_user:bench_pass@localhost:3307/bench_source"
+    table: "bench_source.bench_data_{size}"
+    docker: bench-mysql-source
+    seed: true
+    database: bench_source
+
+  local_mongodb:
+    type: mongodb
+    uri: "mongodb://localhost:27018/?directConnection=true&replicaSet=rs0"
+    table: "bench_source.bench_data_bson_{size}"
+    docker: bench-mongo-source
+    seed: true
+    database: bench_source
+
+  local_duckdb:
+    type: duckdb
+    uri: "duckdb:///{bench_dir}/duckdb_files/bench_source.duckdb"
+    table: "main.bench_data_{size}"
+    seed: true
+
+destinations:
+  local_postgres:
+    type: postgres
+    uri: "postgres://bench_user:bench_pass@localhost:5441/bench_dest?sslmode=disable"
+    table: "public.bench_data"
+    docker: bench-pg-dest
+
+  local_duckdb:
+    type: duckdb
+    uri: "duckdb:///{bench_dir}/duckdb_files/bench_dest.duckdb"
+    table: "main.bench_data"
+
+  local_sqlserver:
+    type: mssql
+    uri: "mssql://sa:TestPassword123%21@localhost:1434/master?encrypt=disable"
+    table: "dbo.bench_data"
+    docker: bench-mssql-dest
+
+  local_clickhouse:
+    type: clickhouse
+    uri: "clickhouse://bench_user:bench_pass@localhost:9001/bench_dest?http_port=8124&secure=0"
+    table: "bench_dest.bench_data"
+    docker: bench-clickhouse-dest
+
+  remote_postgres:
+    type: postgres
+    uri_from_env: BENCH_REMOTE_PG_URI
+    table: "public.bench_data"
+
+  bigquery:
+    type: bigquery
+    uri_from_env: BENCH_BQ_URI
+    table: bench_data
+
+  snowflake:
+    type: snowflake
+    uri_from_env: BENCH_SNOWFLAKE_URI
+    table: public.bench_data
+
+scenarios:
+  - source: local_kafka
+    destination: local_postgres
+
+  - source: local_kafka
+    destination: local_duckdb
+
+  # Local (self-contained, no external dependencies)
+  - source: local_postgres
+    destination: local_postgres
+
+  - source: local_postgres
+    destination: local_duckdb
+
+  - source: local_duckdb
+    destination: local_duckdb
+
+  - source: local_duckdb
+    destination: local_postgres
+
+  - source: local_mysql
+    destination: local_postgres
+
+  - source: local_mongodb
+    destination: local_postgres
+
+  - source: local_mongodb
+    destination: local_duckdb
+
+  - source: local_postgres
+    destination: local_sqlserver
+
+  - source: local_mysql
+    destination: local_sqlserver
+
+  - source: local_mongodb
+    destination: local_sqlserver
+
+  - source: local_duckdb
+    destination: local_sqlserver
+
+  - source: local_postgres
+    destination: local_clickhouse
+
+  - source: local_mysql
+    destination: local_clickhouse
+
+  - source: local_mongodb
+    destination: local_clickhouse
+
+  - source: local_duckdb
+    destination: local_clickhouse
+
+  # Remote Postgres (requires BENCH_REMOTE_PG_URI env var)
+  - source: local_postgres
+    destination: remote_postgres
+
+  - source: local_mysql
+    destination: remote_postgres
+
+  - source: local_mongodb
+    destination: remote_postgres
+
+  - source: local_duckdb
+    destination: remote_postgres
+
+  # BigQuery (requires BENCH_BQ_URI and GOOGLE_APPLICATION_CREDENTIALS env vars)
+  - source: local_postgres
+    destination: bigquery
+
+  - source: local_mysql
+    destination: bigquery
+
+  - source: local_mongodb
+    destination: bigquery
+
+  - source: local_duckdb
+    destination: bigquery
+
+  # Snowflake (requires BENCH_SNOWFLAKE_URI env var)
+  - source: local_postgres
+    destination: snowflake
+
+  - source: local_mysql
+    destination: snowflake
+
+  - source: local_mongodb
+    destination: snowflake
+
+  - source: local_duckdb
+    destination: snowflake
+
+tools:
+  # Keep the standard five-run plus warmup sweep from spending hours on known
+  # slow combinations. The 1k and 100k sizes remain fully covered.
+  gong:
+    binary: bin/ingestr
+
+  ingestr:
+    command_prefix: "uv tool run --python 3.12 --with pyodbc ingestr@0.14.155 ingest"
+    requires: uv
+    uri_scheme_overrides:
+      postgres: postgresql
+    extra_args_by_source:
+      mysql: "--columns float_val:double"
+    extra_args_by_destination:
+      mssql: "--columns json_val:text"
+    skip:
+      - source_type: kafka
+      - source_type: mongodb
+        destination_type: mssql
+      - source_type: mongodb
+        sizes: ["10m"]
+      - destination_type: mssql
+        sizes: ["10m"]
+
+  sling:
+    requires: sling
+    skip:
+      - source_type: kafka
+      - destination_type: mssql
+        sizes: ["1m", "10m"]
+      - source_type: mongodb
+        sizes: ["10m"]
+
+  dlt:
+    script: scripts/bench_dlt.py
+    requires: uv
+    backend: pyarrow
+    backend_overrides:
+      - source: local_mongodb
+        destination_type: postgres
+        backend: default
+      - source: local_mongodb
+        destination_type: mssql
+        backend: default
+    skip:
+      - destination_type: mssql
+        sizes: ["1m", "10m"]
+      - source_type: mongodb
+        destination_type: postgres
+        sizes: ["10m"]
+
+  airbyte:
+    script: scripts/bench_airbyte.py
+    requires: uv
+    skip:
+      - source_type: duckdb
+      - destination_type: duckdb
+      - destination_type: bigquery
+      - destination_type: snowflake
+      - destination_type: mssql
+      - sizes: ["10m"]
+
+  spark:
+    script: scripts/bench_spark.py
+    requires:
+      - uv
+      - java
+    skip:
+      - source_type: mongodb
+      - destination_type: bigquery
+      - destination_type: snowflake
+      - destination_type: duckdb
+        sizes: ["1m", "10m"]

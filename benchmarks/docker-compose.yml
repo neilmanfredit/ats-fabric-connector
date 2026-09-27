@@ -1,0 +1,183 @@
+services:
+  bench-kafka-source:
+    profiles: [kafka]
+    image: apache/kafka:3.9.1
+    container_name: bench-kafka-source
+    ports:
+      - "9094:9094"
+      - "9095:9095"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:9094,DOCKER://:9095,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://bench-kafka-source:9092,EXTERNAL://localhost:9094,DOCKER://${BENCH_KAFKA_DOCKER_HOST:-host.docker.internal}:9095
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,DOCKER:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@bench-kafka-source:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  bench-pg-source:
+    image: postgres:16
+    container_name: bench-pg-source
+    environment:
+      POSTGRES_USER: bench_user
+      POSTGRES_PASSWORD: bench_pass
+      POSTGRES_DB: bench_source
+    ports:
+      - "5440:5432"
+    command: >
+      postgres
+      -c shared_buffers=512MB
+      -c work_mem=256MB
+      -c maintenance_work_mem=512MB
+      -c max_wal_size=2GB
+      -c checkpoint_completion_target=0.9
+      -c wal_level=minimal
+      -c max_wal_senders=0
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bench_user -d bench_source"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    shm_size: '1g'
+
+  bench-pg-dest:
+    image: postgres:16
+    container_name: bench-pg-dest
+    environment:
+      POSTGRES_USER: bench_user
+      POSTGRES_PASSWORD: bench_pass
+      POSTGRES_DB: bench_dest
+    ports:
+      - "5441:5432"
+    tmpfs:
+      - /var/lib/postgresql/data:size=8g
+    volumes:
+      - ./sql/postgres_fast_sink.sql:/docker-entrypoint-initdb.d/postgres_fast_sink.sql:ro
+    command: >
+      postgres
+      -c unix_socket_directories=/var/run/postgresql
+      -c shared_buffers=6GB
+      -c work_mem=16MB
+      -c maintenance_work_mem=128MB
+      -c max_wal_size=2GB
+      -c min_wal_size=80MB
+      -c checkpoint_timeout=1h
+      -c checkpoint_completion_target=0.9
+      -c wal_level=minimal
+      -c max_wal_senders=0
+      -c max_connections=32
+      -c autovacuum=off
+      -c bgwriter_lru_maxpages=0
+      -c synchronous_commit=off
+      -c fsync=off
+      -c full_page_writes=off
+      -c jit=off
+      -c track_io_timing=on
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bench_user -d bench_dest"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    shm_size: '6g'
+
+  bench-mssql-dest:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: bench-mssql-dest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "TestPassword123!"
+      MSSQL_PID: "Developer"
+    ports:
+      - "1434:1433"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$${MSSQL_SA_PASSWORD}\" -C -Q \"SELECT 1\" >/dev/null || /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P \"$${MSSQL_SA_PASSWORD}\" -Q \"SELECT 1\" >/dev/null",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    shm_size: '1g'
+
+  bench-clickhouse-dest:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: bench-clickhouse-dest
+    environment:
+      CLICKHOUSE_DB: bench_dest
+      CLICKHOUSE_USER: bench_user
+      CLICKHOUSE_PASSWORD: bench_pass
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "8124:8123"
+      - "9001:9000"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "clickhouse-client --user bench_user --password bench_pass --database bench_dest --query 'SELECT 1' >/dev/null",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  bench-mysql-source:
+    image: mysql:8.0
+    container_name: bench-mysql-source
+    environment:
+      MYSQL_ROOT_PASSWORD: root_pass
+      MYSQL_USER: bench_user
+      MYSQL_PASSWORD: bench_pass
+      MYSQL_DATABASE: bench_source
+    ports:
+      - "3307:3306"
+    command: >
+      --innodb-buffer-pool-size=6G
+      --innodb-redo-log-capacity=2G
+      --innodb-log-buffer-size=256M
+      --innodb-flush-log-at-trx-commit=0
+      --innodb-doublewrite=0
+      --innodb-flush-method=O_DIRECT
+      --innodb-adaptive-hash-index=OFF
+      --performance-schema=OFF
+      --skip-log-bin
+      --skip-name-resolve
+      --max-connections=32
+      --net-buffer-length=1M
+      --local-infile=1
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot_pass"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  bench-mongo-source:
+    image: mongo:8.2.7
+    container_name: bench-mongo-source
+    ports:
+      - "27018:27017"
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--wiredTigerCacheSizeGB", "1"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mongosh --quiet --eval 'try { rs.status().ok } catch (e) { rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"host.docker.internal:27018\"}]}).ok }' | grep 1",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 30

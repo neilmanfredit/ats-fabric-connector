@@ -1,0 +1,1979 @@
+package mongodb
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/bruin-data/ingestr/internal/arrowutil"
+	"github.com/bruin-data/ingestr/pkg/schema"
+	"github.com/bruin-data/ingestr/pkg/source"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
+)
+
+var benchmarkJSONString string
+
+func TestGetTablePrimaryKeyUniqueness(t *testing.T) {
+	tests := []struct {
+		name             string
+		table            string
+		primaryKey       []string
+		collectionUnique bool
+		wantUnique       bool
+	}{
+		{
+			name:             "normal collection",
+			table:            "bench.events",
+			collectionUnique: true,
+			wantUnique:       true,
+		},
+		{
+			name:       "view",
+			table:      "bench.events_view",
+			wantUnique: false,
+		},
+		{
+			name:             "aggregation pipeline",
+			table:            `bench.events:[{"$unwind":"$items"}]`,
+			collectionUnique: true,
+			wantUnique:       false,
+		},
+		{
+			name:             "user-provided key",
+			table:            "bench.events",
+			primaryKey:       []string{"external_id"},
+			collectionUnique: true,
+			wantUnique:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mongoSource := &MongoDBSource{
+				collectionPrimaryKeyUniqueFn: func(context.Context, string, string) (bool, error) {
+					return tt.collectionUnique, nil
+				},
+			}
+			table, err := mongoSource.GetTable(t.Context(), source.TableRequest{
+				Name:        tt.table,
+				PrimaryKeys: tt.primaryKey,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := table.(source.PrimaryKeyUniquenessProvider).PrimaryKeysUnique()
+			if got != tt.wantUnique {
+				t.Fatalf("PrimaryKeysUnique() = %v, want %v", got, tt.wantUnique)
+			}
+		})
+	}
+}
+
+func TestParseTableSpec(t *testing.T) {
+	tests := []struct {
+		name      string
+		uriDB     string
+		input     string
+		wantDB    string
+		wantCol   string
+		wantQuery bool
+		wantErr   bool
+	}{
+		{
+			name:    "database.collection from table name",
+			input:   "bugece.event",
+			wantDB:  "bugece",
+			wantCol: "event",
+		},
+		{
+			name:    "plain collection without database errors (regular path)",
+			input:   "movies",
+			wantErr: true,
+		},
+		{
+			name:    "multiple dots splits on first dot only",
+			input:   "mydb.my.collection",
+			wantDB:  "mydb",
+			wantCol: "my.collection",
+		},
+		{
+			name:      "custom query with database.collection",
+			input:     `bugece.event:[{"$match":{"status":"active"}}]`,
+			wantDB:    "bugece",
+			wantCol:   "event",
+			wantQuery: true,
+		},
+		{
+			name:      "custom query without dot falls back to URI database",
+			uriDB:     "mydb_from_uri",
+			input:     `event:[{"$match":{"status":"active"}}]`,
+			wantDB:    "mydb_from_uri",
+			wantCol:   "event",
+			wantQuery: true,
+		},
+		{
+			name:    "custom query without dot and no URI database errors",
+			uriDB:   "",
+			input:   `event:[{"$match":{"status":"active"}}]`,
+			wantErr: true,
+		},
+		{
+			name:    "invalid query JSON",
+			input:   `bugece.event:[not valid json`,
+			wantErr: true,
+		},
+		{
+			name:    "empty pipeline",
+			input:   `bugece.event:[]`,
+			wantErr: true,
+		},
+		{
+			name:    "empty database part",
+			input:   ".event",
+			wantErr: true,
+		},
+		{
+			name:    "empty collection part",
+			input:   "bugece.",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &MongoDBSource{database: tt.uriDB}
+			db, col, query, err := s.parseTableSpec(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if db != tt.wantDB {
+				t.Errorf("database: got %q, want %q", db, tt.wantDB)
+			}
+			if col != tt.wantCol {
+				t.Errorf("collection: got %q, want %q", col, tt.wantCol)
+			}
+			if tt.wantQuery && query == nil {
+				t.Errorf("expected non-nil query")
+			}
+			if !tt.wantQuery && query != nil {
+				t.Errorf("expected nil query, got %v", query)
+			}
+		})
+	}
+}
+
+func TestMongoExtractPartitionFilter(t *testing.T) {
+	start := int64(100)
+	end := int64(200)
+	tests := []struct {
+		name string
+		opts source.ReadOptions
+		want bson.D
+	}{
+		{
+			name: "exclusive numeric range",
+			opts: source.ReadOptions{
+				ExtractPartitionBy:           "id",
+				ExtractPartitionKind:         source.ExtractPartitionKindNumeric,
+				ExtractPartitionNumericStart: &start,
+				ExtractPartitionNumericEnd:   &end,
+			},
+			want: bson.D{{Key: "id", Value: bson.D{{Key: "$gte", Value: start}, {Key: "$lt", Value: end}}}},
+		},
+		{
+			name: "open-ended final range",
+			opts: source.ReadOptions{
+				ExtractPartitionBy:           "id",
+				ExtractPartitionKind:         source.ExtractPartitionKindNumeric,
+				ExtractPartitionNumericStart: &start,
+				ExtractPartitionNumericEnd:   &end,
+				ExtractPartitionEndInclusive: true,
+			},
+			want: bson.D{{Key: "id", Value: bson.D{{Key: "$gte", Value: start}}}},
+		},
+		{
+			name: "null and missing values",
+			opts: source.ReadOptions{ExtractPartitionBy: "id", ExtractPartitionIsNull: true},
+			want: bson.D{{Key: "id", Value: nil}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := bson.Marshal(mongoExtractPartitionFilter(tt.opts))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := bson.Marshal(tt.want)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("filter = %v, want %v", mongoExtractPartitionFilter(tt.opts), tt.want)
+			}
+		})
+	}
+}
+
+func TestMongoIncrementalFilter(t *testing.T) {
+	start := time.Date(2026, 7, 24, 15, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 7, 24, 15, 59, 59, 999_000_000, time.UTC)
+
+	got, err := bson.Marshal(mongoIncrementalFilter(source.ReadOptions{
+		IncrementalKey: "updated_at",
+		IntervalStart:  &start,
+		IntervalEnd:    &end,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := bson.Marshal(bson.D{{
+		Key: "updated_at",
+		Value: bson.D{
+			{Key: "$gte", Value: start},
+			{Key: "$lte", Value: end},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("filter BSON = %v, want %v", got, want)
+	}
+}
+
+func TestValidateIncrementalKeyProjection(t *testing.T) {
+	tests := []struct {
+		name           string
+		pipeline       []bson.M
+		incrementalKey string
+		wantErr        bool
+	}{
+		{
+			name:           "inclusion projection with key present",
+			pipeline:       []bson.M{{"$project": bson.M{"_id": 1, "name": 1, "created_at": 1}}},
+			incrementalKey: "created_at",
+		},
+		{
+			name:           "inclusion projection missing key",
+			pipeline:       []bson.M{{"$project": bson.M{"_id": 1, "name": 1}}},
+			incrementalKey: "created_at",
+			wantErr:        true,
+		},
+		{
+			name:           "exclusion projection (key included by default)",
+			pipeline:       []bson.M{{"$project": bson.M{"password": float64(0)}}},
+			incrementalKey: "created_at",
+		},
+		{
+			name:           "no project stage",
+			pipeline:       []bson.M{{"$match": bson.M{"status": "active"}}},
+			incrementalKey: "created_at",
+		},
+		{
+			name: "project stage after match with key present",
+			pipeline: []bson.M{
+				{"$match": bson.M{"status": "active"}},
+				{"$project": bson.M{"status": 1, "created_at": 1}},
+			},
+			incrementalKey: "created_at",
+		},
+		{
+			name: "project stage after match missing key",
+			pipeline: []bson.M{
+				{"$match": bson.M{"status": "active"}},
+				{"$project": bson.M{"status": 1}},
+			},
+			incrementalKey: "created_at",
+			wantErr:        true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateIncrementalKeyProjection(tt.pipeline, tt.incrementalKey)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestExtractDatabase(t *testing.T) {
+	tests := []struct {
+		name string
+		uri  string
+		want string
+	}{
+		{
+			name: "standard mongodb URI",
+			uri:  "mongodb://localhost:27017/mydb",
+			want: "mydb",
+		},
+		{
+			name: "mongodb+srv URI",
+			uri:  "mongodb+srv://user:pass@cluster.example.net/sample_mflix?appName=Cluster0",
+			want: "sample_mflix",
+		},
+		{
+			name: "no database in URI",
+			uri:  "mongodb://localhost:27017",
+			want: "",
+		},
+		{
+			name: "empty path",
+			uri:  "mongodb://localhost:27017/",
+			want: "",
+		},
+		{
+			name: "URI with query params",
+			uri:  "mongodb://localhost:27017/testdb?retryWrites=true",
+			want: "testdb",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractDatabase(tt.uri)
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSubstituteIntervalParams(t *testing.T) {
+	start := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	t.Run("replaces both placeholders", func(t *testing.T) {
+		pipeline := []bson.M{
+			{"$match": bson.M{
+				"created_at": bson.M{
+					"$gte": ":interval_start",
+					"$lt":  ":interval_end",
+				},
+			}},
+		}
+
+		result := substituteIntervalParams(pipeline, &start, &end)
+
+		match := result[0]["$match"].(bson.M)
+		createdAt := match["created_at"].(bson.M)
+
+		startVal, ok := createdAt["$gte"].(primitive.DateTime)
+		if !ok {
+			t.Fatalf("expected primitive.DateTime for $gte, got %T", createdAt["$gte"])
+		}
+		if !startVal.Time().Equal(start) {
+			t.Errorf("$gte: got %v, want %v", startVal.Time(), start)
+		}
+
+		endVal, ok := createdAt["$lt"].(primitive.DateTime)
+		if !ok {
+			t.Fatalf("expected primitive.DateTime for $lt, got %T", createdAt["$lt"])
+		}
+		if !endVal.Time().Equal(end) {
+			t.Errorf("$lt: got %v, want %v", endVal.Time(), end)
+		}
+	})
+
+	t.Run("nil intervals leaves placeholders unchanged", func(t *testing.T) {
+		pipeline := []bson.M{
+			{"$match": bson.M{"date": ":interval_start"}},
+		}
+
+		result := substituteIntervalParams(pipeline, nil, nil)
+		match := result[0]["$match"].(bson.M)
+		if match["date"] != ":interval_start" {
+			t.Errorf("expected placeholder unchanged, got %v", match["date"])
+		}
+	})
+
+	t.Run("nested arrays are traversed", func(t *testing.T) {
+		pipeline := []bson.M{
+			{"$match": bson.M{
+				"$or": []any{
+					bson.M{"start": ":interval_start"},
+					bson.M{"end": ":interval_end"},
+				},
+			}},
+		}
+
+		result := substituteIntervalParams(pipeline, &start, &end)
+		match := result[0]["$match"].(bson.M)
+		or := match["$or"].([]any)
+
+		startItem := or[0].(bson.M)
+		if _, ok := startItem["start"].(primitive.DateTime); !ok {
+			t.Errorf("expected primitive.DateTime in nested array, got %T", startItem["start"])
+		}
+	})
+
+	t.Run("non-placeholder strings are untouched", func(t *testing.T) {
+		pipeline := []bson.M{
+			{"$match": bson.M{"status": "active"}},
+		}
+
+		result := substituteIntervalParams(pipeline, &start, &end)
+		match := result[0]["$match"].(bson.M)
+		if match["status"] != "active" {
+			t.Errorf("expected 'active', got %v", match["status"])
+		}
+	})
+}
+
+func TestNormalizeBatchSize(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{name: "default when unset", in: 0, want: defaultBatchSize},
+		{name: "keep smaller batch", in: 5000, want: 5000},
+		{name: "keep larger explicit batch", in: 25000, want: 25000},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizeBatchSize(tt.in)
+			if got != tt.want {
+				t.Fatalf("normalizeBatchSize(%d) = %d, want %d", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseMongoDBCDCURI(t *testing.T) {
+	t.Run("mongodb cdc strips cdc params and keeps driver params", func(t *testing.T) {
+		cfg, normalized, err := parseMongoDBCDCURI("mongodb+cdc://user:pass@localhost:27017/app?mode=stream&dest_schema=raw&max_await_time=2s&schema_sample_size=42&replicaSet=rs0")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.DestSchema != "raw" {
+			t.Fatalf("dest schema = %q, want raw", cfg.DestSchema)
+		}
+		if cfg.MaxAwaitTime != 2*time.Second {
+			t.Fatalf("max await = %v, want 2s", cfg.MaxAwaitTime)
+		}
+		if cfg.SchemaSampleSize != 42 {
+			t.Fatalf("sample size = %d, want 42", cfg.SchemaSampleSize)
+		}
+		if !strings.HasPrefix(normalized, "mongodb://") {
+			t.Fatalf("normalized URI = %q, want mongodb scheme", normalized)
+		}
+		if strings.Contains(normalized, "mode=") || strings.Contains(normalized, "dest_schema=") || strings.Contains(normalized, "max_await_time=") {
+			t.Fatalf("normalized URI still contains CDC-only params: %s", normalized)
+		}
+		if !strings.Contains(normalized, "replicaSet=rs0") {
+			t.Fatalf("normalized URI dropped driver param: %s", normalized)
+		}
+	})
+
+	t.Run("mongodb srv cdc keeps srv base scheme", func(t *testing.T) {
+		_, normalized, err := parseMongoDBCDCURI("mongodb+srv+cdc://cluster.example.com/app?mode=batch")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.HasPrefix(normalized, "mongodb+srv://") {
+			t.Fatalf("normalized URI = %q, want mongodb+srv scheme", normalized)
+		}
+	})
+}
+
+func TestParseMongoCDCNamespace(t *testing.T) {
+	tests := []struct {
+		name      string
+		defaultDB string
+		table     string
+		wantDB    string
+		wantColl  string
+		wantName  string
+		wantErr   bool
+	}{
+		{name: "qualified table", table: "app.users", wantDB: "app", wantColl: "users", wantName: "app.users"},
+		{name: "plain collection uses uri db", defaultDB: "app", table: "users", wantDB: "app", wantColl: "users", wantName: "users"},
+		{name: "plain collection without uri db errors", table: "users", wantErr: true},
+		{name: "aggregation pipeline rejected", defaultDB: "app", table: `users:[{"$match":{}}]`, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseMongoCDCNamespace(tt.defaultDB, tt.table)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Database != tt.wantDB || got.Collection != tt.wantColl || got.Name != tt.wantName {
+				t.Fatalf("got %+v, want db=%q coll=%q name=%q", got, tt.wantDB, tt.wantColl, tt.wantName)
+			}
+		})
+	}
+}
+
+func TestMongoCDCSelectTables(t *testing.T) {
+	src := &MongoDBCDCSource{database: "app"}
+	if err := src.SelectTables([]string{"users", "app.orders"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Both a bare and a database-qualified request resolve to the collection
+	// name the source reports, case-insensitively.
+	resolved, err := src.selection.Resolve([]string{"Users", "ORDERS", "invoices"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, collection := range []string{"Users", "ORDERS"} {
+		if _, ok := resolved[collection]; !ok {
+			t.Fatalf("expected %q to be selected", collection)
+		}
+	}
+	if _, ok := resolved["invoices"]; ok {
+		t.Fatal("did not expect an unrequested collection to be selected")
+	}
+
+	// MongoDB collection names are case-sensitive, so a case-insensitive match
+	// must never pull in a second collection alongside the one requested.
+	resolved, err = src.selection.Resolve([]string{"users", "Users", "orders"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := resolved["Users"]; ok {
+		t.Fatalf("resolved = %v, want only the exactly-named users", resolved)
+	}
+	if _, ok := resolved["users"]; !ok {
+		t.Fatalf("resolved = %v, want users", resolved)
+	}
+
+	if err := src.SelectTables([]string{"users", "other.users"}); err == nil {
+		t.Fatal("expected a collection naming a different database to be rejected")
+	}
+	if err := src.SelectTables([]string{"users", "app.users"}); err == nil {
+		t.Fatal("expected two spellings of the same collection to be rejected")
+	}
+}
+
+func TestMongoCDCLSNRoundTrip(t *testing.T) {
+	token := bson.Raw{0x05, 0x00, 0x00, 0x00, 0x00}
+	ts := primitive.Timestamp{T: 123, I: 45}
+
+	lsn := formatMongoCDCLSN(ts, token)
+	start, err := parseMongoCDCLSN(lsn)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if start.OperationTime != ts {
+		t.Fatalf("operation time = %+v, want %+v", start.OperationTime, ts)
+	}
+	if string(start.ResumeToken) != string(token) {
+		t.Fatalf("resume token = %x, want %x", []byte(start.ResumeToken), []byte(token))
+	}
+
+	snapshotLSN := formatMongoCDCLSN(ts, nil)
+	start, err = parseMongoCDCLSN(snapshotLSN)
+	if err != nil {
+		t.Fatalf("unexpected snapshot parse error: %v", err)
+	}
+	if len(start.ResumeToken) != 0 {
+		t.Fatalf("snapshot resume token = %x, want empty", []byte(start.ResumeToken))
+	}
+}
+
+func TestMongoCDCAfterBatchTarget(t *testing.T) {
+	target := primitive.Timestamp{T: 100, I: 5}
+	tests := []struct {
+		name string
+		ts   primitive.Timestamp
+		want bool
+	}{
+		{name: "before second", ts: primitive.Timestamp{T: 99, I: 99}, want: false},
+		{name: "before increment", ts: primitive.Timestamp{T: 100, I: 4}, want: false},
+		{name: "equal target", ts: primitive.Timestamp{T: 100, I: 5}, want: false},
+		{name: "after increment", ts: primitive.Timestamp{T: 100, I: 6}, want: true},
+		{name: "after second", ts: primitive.Timestamp{T: 101, I: 0}, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := mongoCDCAfterBatchTarget(tt.ts, &target); got != tt.want {
+				t.Fatalf("mongoCDCAfterBatchTarget() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	if mongoCDCAfterBatchTarget(primitive.Timestamp{T: 101}, nil) {
+		t.Fatal("nil target should not stop batch")
+	}
+}
+
+func TestMongoCDCStreamingFlushOptions(t *testing.T) {
+	batchOpts := source.ReadOptions{PageSize: 123}
+	if got := mongoCDCSourceBatchSize(batchOpts); got != 123 {
+		t.Fatalf("batch size = %d, want page size", got)
+	}
+
+	streamOpts := source.ReadOptions{
+		Streaming:     true,
+		PageSize:      123,
+		FlushRecords:  7,
+		FlushInterval: 250 * time.Millisecond,
+	}
+	if got := mongoCDCSourceBatchSize(streamOpts); got != 7 {
+		t.Fatalf("streaming batch size = %d, want flush records", got)
+	}
+	if got := mongoCDCFlushInterval(streamOpts); got != 250*time.Millisecond {
+		t.Fatalf("streaming flush interval = %v, want 250ms", got)
+	}
+}
+
+func TestMongoCDCEventBufferAllowsFieldsOutsideSchema(t *testing.T) {
+	tableSchema := addMongoCDCColumns(&schema.TableSchema{
+		Name: "items",
+		Columns: []schema.Column{
+			{Name: "_id", DataType: schema.TypeInt64, Nullable: false},
+			{Name: "name", DataType: schema.TypeString, Nullable: true},
+		},
+		PrimaryKeys: []string{"_id"},
+	})
+
+	buffer := newMongoCDCEventBuffer(tableSchema, nil, "items", 10)
+	defer buffer.release()
+
+	err := buffer.append(context.Background(), bson.M{
+		"_id":   int64(1),
+		"name":  "item1",
+		"value": int64(100),
+	}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if buffer.rows != 1 {
+		t.Fatalf("buffer rows = %d, want 1", buffer.rows)
+	}
+}
+
+func TestMongoCDCEventBufferAllowsExcludedUnknownFields(t *testing.T) {
+	tableSchema := addMongoCDCColumns(&schema.TableSchema{
+		Name: "items",
+		Columns: []schema.Column{
+			{Name: "_id", DataType: schema.TypeInt64, Nullable: false},
+			{Name: "name", DataType: schema.TypeString, Nullable: true},
+		},
+		PrimaryKeys: []string{"_id"},
+	})
+
+	buffer := newMongoCDCEventBuffer(tableSchema, []string{"value"}, "items", 10)
+	defer buffer.release()
+
+	unknown := buffer.unknownDocumentFields(bson.M{
+		"_id":   int64(1),
+		"name":  "item1",
+		"value": int64(100),
+	})
+	if len(unknown) != 0 {
+		t.Fatalf("unknown fields = %v, want none", unknown)
+	}
+}
+
+func TestMongoCDCEventBufferFlushBlockingHonorsCanceledContext(t *testing.T) {
+	tableSchema := addMongoCDCColumns(&schema.TableSchema{
+		Name: "items",
+		Columns: []schema.Column{
+			{Name: "_id", DataType: schema.TypeInt64, Nullable: false},
+			{Name: "name", DataType: schema.TypeString, Nullable: true},
+		},
+		PrimaryKeys: []string{"_id"},
+	})
+
+	buffer := newMongoCDCEventBuffer(tableSchema, nil, "items", 10)
+	defer buffer.release()
+
+	err := buffer.append(context.Background(), bson.M{
+		"_id":  int64(1),
+		"name": "item1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("unexpected append error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = buffer.flushBlocking(ctx, make(chan source.RecordBatchResult))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("flushBlocking error = %v, want context.Canceled", err)
+	}
+}
+
+func TestMongoCDCEventDocument(t *testing.T) {
+	t.Run("update uses full document and keeps document key", func(t *testing.T) {
+		doc, deleted, ok := mongoCDCEventDocument(mongoCDCChangeEvent{
+			OperationType: "update",
+			DocumentKey:   bson.M{"_id": int64(1)},
+			FullDocument:  bson.M{"name": "alice"},
+		})
+		if !ok || deleted {
+			t.Fatalf("ok=%v deleted=%v, want ok active", ok, deleted)
+		}
+		if doc["_id"] != int64(1) || doc["name"] != "alice" {
+			t.Fatalf("unexpected doc: %#v", doc)
+		}
+	})
+
+	t.Run("delete uses document key", func(t *testing.T) {
+		doc, deleted, ok := mongoCDCEventDocument(mongoCDCChangeEvent{
+			OperationType: "delete",
+			DocumentKey:   bson.M{"_id": int64(2)},
+		})
+		if !ok || !deleted {
+			t.Fatalf("ok=%v deleted=%v, want ok deleted", ok, deleted)
+		}
+		if doc["_id"] != int64(2) {
+			t.Fatalf("unexpected doc: %#v", doc)
+		}
+	})
+
+	t.Run("update without full document ignored", func(t *testing.T) {
+		_, _, ok := mongoCDCEventDocument(mongoCDCChangeEvent{
+			OperationType: "update",
+			DocumentKey:   bson.M{"_id": int64(3)},
+		})
+		if ok {
+			t.Fatal("expected incomplete update event to be ignored")
+		}
+	})
+
+	t.Run("non data event ignored", func(t *testing.T) {
+		_, _, ok := mongoCDCEventDocument(mongoCDCChangeEvent{OperationType: "drop"})
+		if ok {
+			t.Fatal("expected non-data event to be ignored")
+		}
+	})
+}
+
+func TestMongoCDCPrimaryKeys(t *testing.T) {
+	pks, err := mongoCDCPrimaryKeys(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pks) != 1 || pks[0] != "_id" {
+		t.Fatalf("primary keys = %v, want [_id]", pks)
+	}
+
+	if _, err := mongoCDCPrimaryKeys([]string{"id"}); err == nil {
+		t.Fatal("expected custom primary key error")
+	}
+}
+
+func TestMongoBatchBuilder_AppendsAndBackfillsNulls(t *testing.T) {
+	builder := newMongoBatchBuilder([]string{"skip"})
+
+	if err := builder.AppendDocument(bson.M{"alpha": "one", "skip": "ignored"}); err != nil {
+		t.Fatalf("AppendDocument() first doc error = %v", err)
+	}
+	if err := builder.AppendDocument(bson.M{"beta": int32(2)}); err != nil {
+		t.Fatalf("AppendDocument() second doc error = %v", err)
+	}
+
+	record, err := builder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("NewRecordBatch() error = %v", err)
+	}
+	defer record.Release()
+
+	if got := record.NumRows(); got != 2 {
+		t.Fatalf("record.NumRows() = %d, want 2", got)
+	}
+	if got := record.NumCols(); got != 2 {
+		t.Fatalf("record.NumCols() = %d, want 2", got)
+	}
+
+	if got := record.Schema().Field(0).Name; got != "alpha" {
+		t.Fatalf("field 0 = %q, want alpha", got)
+	}
+	if got := record.Schema().Field(1).Name; got != "beta" {
+		t.Fatalf("field 1 = %q, want beta", got)
+	}
+
+	if got := arrowutil.Value(record.Column(0), 0); got != "one" {
+		t.Fatalf("alpha row 0 = %#v, want %q", got, "one")
+	}
+	if got := arrowutil.Value(record.Column(0), 1); got != nil {
+		t.Fatalf("alpha row 1 = %#v, want nil", got)
+	}
+	if got := arrowutil.Value(record.Column(1), 0); got != nil {
+		t.Fatalf("beta row 0 = %#v, want nil", got)
+	}
+	if got := arrowutil.Value(record.Column(1), 1); got != int64(2) {
+		t.Fatalf("beta row 1 = %#v, want %v", got, int64(2))
+	}
+}
+
+func TestMongoBatchBuilder_NewRecordBatchResetsBuilder(t *testing.T) {
+	builder := newMongoBatchBuilder(nil)
+
+	if err := builder.AppendDocument(bson.M{"beta": int32(2)}); err != nil {
+		t.Fatalf("AppendDocument() first doc error = %v", err)
+	}
+
+	record, err := builder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("NewRecordBatch() error = %v", err)
+	}
+	record.Release()
+
+	if builder.rowCount != 0 {
+		t.Fatalf("builder.rowCount = %d, want 0", builder.rowCount)
+	}
+	if len(builder.fieldOrder) != 0 {
+		t.Fatalf("len(builder.fieldOrder) = %d, want 0", len(builder.fieldOrder))
+	}
+	if len(builder.cols) != 0 {
+		t.Fatalf("len(builder.cols) = %d, want 0", len(builder.cols))
+	}
+
+	if err := builder.AppendDocument(bson.M{"alpha": "one"}); err != nil {
+		t.Fatalf("AppendDocument() after reset error = %v", err)
+	}
+
+	reusedRecord, err := builder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("NewRecordBatch() after reset error = %v", err)
+	}
+	defer reusedRecord.Release()
+
+	if got := reusedRecord.NumRows(); got != 1 {
+		t.Fatalf("reusedRecord.NumRows() = %d, want 1", got)
+	}
+	if got := reusedRecord.Schema().Field(0).Name; got != "alpha" {
+		t.Fatalf("field 0 = %q, want alpha", got)
+	}
+}
+
+func TestMongoBatchBuilder_NewRecordBatchSortsFields(t *testing.T) {
+	builder := newMongoBatchBuilder(nil)
+
+	if err := builder.AppendDocument(bson.M{"zeta": "one"}); err != nil {
+		t.Fatalf("AppendDocument() first doc error = %v", err)
+	}
+	if err := builder.AppendDocument(bson.M{"alpha": int32(2)}); err != nil {
+		t.Fatalf("AppendDocument() second doc error = %v", err)
+	}
+
+	record, err := builder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("NewRecordBatch() error = %v", err)
+	}
+	defer record.Release()
+
+	if got := record.Schema().Field(0).Name; got != "alpha" {
+		t.Fatalf("field 0 = %q, want alpha", got)
+	}
+	if got := record.Schema().Field(1).Name; got != "zeta" {
+		t.Fatalf("field 1 = %q, want zeta", got)
+	}
+}
+
+func TestMongoBatchBuilder_TypedColumnsByValue(t *testing.T) {
+	oid, _ := primitive.ObjectIDFromHex("507f1f77bcf86cd799439011")
+	ts := primitive.NewDateTimeFromTime(time.Date(2026, 4, 15, 10, 0, 0, 0, time.UTC))
+
+	builder := newMongoBatchBuilder(nil)
+	if err := builder.AppendDocument(bson.M{
+		"id":      oid,
+		"score":   3.14,
+		"count":   int64(7),
+		"active":  true,
+		"created": ts,
+		"name":    "alpha",
+	}); err != nil {
+		t.Fatalf("AppendDocument error = %v", err)
+	}
+
+	record, err := builder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("NewRecordBatch error = %v", err)
+	}
+	defer record.Release()
+
+	want := map[string]string{
+		"active":  "bool",
+		"count":   "int64",
+		"created": "timestamp[us, tz=UTC]",
+		"id":      "utf8",
+		"name":    "utf8",
+		"score":   "float64",
+	}
+	for i := 0; i < int(record.NumCols()); i++ {
+		field := record.Schema().Field(i)
+		if got, ok := want[field.Name]; !ok {
+			t.Errorf("unexpected column %q", field.Name)
+		} else if field.Type.String() != got {
+			t.Errorf("%s: type = %s, want %s", field.Name, field.Type, got)
+		}
+	}
+}
+
+func TestMongoBatchBuilder_PromotesOnTypeMismatch(t *testing.T) {
+	builder := newMongoBatchBuilder(nil)
+
+	// First value picks Int64 type, second value (string) forces promotion to unknown.
+	if err := builder.AppendDocument(bson.M{"x": int32(42)}); err != nil {
+		t.Fatalf("AppendDocument 1 error = %v", err)
+	}
+	if err := builder.AppendDocument(bson.M{"x": "hello"}); err != nil {
+		t.Fatalf("AppendDocument 2 error = %v", err)
+	}
+
+	record, err := builder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("NewRecordBatch error = %v", err)
+	}
+	defer record.Release()
+
+	field := record.Schema().Field(0)
+	if field.Name != "x" {
+		t.Fatalf("field 0 name = %q, want x", field.Name)
+	}
+	// Promoted to the unknown extension type so that mixed values can be JSON-encoded.
+	if !isUnknownType(field.Type) {
+		t.Fatalf("expected promoted column to use unknown type, got %s", field.Type)
+	}
+}
+
+func TestMongoBatchBuilder_PromotesPreservesEarlierValues(t *testing.T) {
+	builder := newMongoBatchBuilder(nil)
+
+	// 50 ints then 50 strings in the same batch. The promotion path must
+	// re-encode the earlier int values as JSON strings so no data is lost.
+	for i := range 50 {
+		if err := builder.AppendDocument(bson.M{"v": int64(i)}); err != nil {
+			t.Fatalf("AppendDocument int #%d error = %v", i, err)
+		}
+	}
+	for i := 50; i < 100; i++ {
+		if err := builder.AppendDocument(bson.M{"v": fmt.Sprintf("str_%d", i)}); err != nil {
+			t.Fatalf("AppendDocument str #%d error = %v", i, err)
+		}
+	}
+
+	record, err := builder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("NewRecordBatch error = %v", err)
+	}
+	defer record.Release()
+
+	if got := record.NumRows(); got != 100 {
+		t.Fatalf("NumRows = %d, want 100", got)
+	}
+	if !isUnknownType(record.Schema().Field(0).Type) {
+		t.Fatalf("expected unknown type after promotion, got %s", record.Schema().Field(0).Type)
+	}
+
+	// Earlier int values are JSON-encoded as their decimal representation.
+	if got := arrowutil.Value(record.Column(0), 0); got != "0" {
+		t.Errorf("row 0 = %#v, want %q", got, "0")
+	}
+	if got := arrowutil.Value(record.Column(0), 49); got != "49" {
+		t.Errorf("row 49 = %#v, want %q", got, "49")
+	}
+	// Later string values are JSON-encoded with quotes.
+	if got := arrowutil.Value(record.Column(0), 50); got != `"str_50"` {
+		t.Errorf("row 50 = %#v, want %q", got, `"str_50"`)
+	}
+	if got := arrowutil.Value(record.Column(0), 99); got != `"str_99"` {
+		t.Errorf("row 99 = %#v, want %q", got, `"str_99"`)
+	}
+}
+
+func TestMongoBatchBuilder_NewColumnMidBatchBackfillsNulls(t *testing.T) {
+	builder := newMongoBatchBuilder(nil)
+
+	for i := range 5 {
+		if err := builder.AppendDocument(bson.M{"a": int64(i)}); err != nil {
+			t.Fatalf("doc %d error = %v", i, err)
+		}
+	}
+	// New column "b" appears at row 5; previous five rows must be back-filled with nulls.
+	if err := builder.AppendDocument(bson.M{"a": int64(5), "b": "hello"}); err != nil {
+		t.Fatalf("doc with new col error = %v", err)
+	}
+
+	record, err := builder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("NewRecordBatch error = %v", err)
+	}
+	defer record.Release()
+
+	bIdx := -1
+	for i := 0; i < int(record.NumCols()); i++ {
+		if record.Schema().Field(i).Name == "b" {
+			bIdx = i
+		}
+	}
+	if bIdx < 0 {
+		t.Fatalf("column b not found")
+	}
+	col := record.Column(bIdx)
+	for i := range 5 {
+		if !col.IsNull(i) {
+			t.Errorf("b row %d expected null, got %v", i, arrowutil.Value(col, i))
+		}
+	}
+	if got := arrowutil.Value(col, 5); got != "hello" {
+		t.Errorf("b row 5 = %#v, want %q", got, "hello")
+	}
+}
+
+func TestMongoBatchBuilder_AllNullColumnEmittedAsUnknown(t *testing.T) {
+	// A column that only ever sees nulls must be emitted as the unknown
+	// extension type so the schema inferrer can drop it (the existing
+	// drop-empty-columns behavior).
+	builder := newMongoBatchBuilder(nil)
+	for i := range 3 {
+		if err := builder.AppendDocument(bson.M{"a": int64(i), "b": nil}); err != nil {
+			t.Fatalf("doc %d error = %v", i, err)
+		}
+	}
+
+	record, err := builder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("NewRecordBatch error = %v", err)
+	}
+	defer record.Release()
+
+	for i := 0; i < int(record.NumCols()); i++ {
+		field := record.Schema().Field(i)
+		if field.Name != "b" {
+			continue
+		}
+		if !isUnknownType(field.Type) {
+			t.Fatalf("all-null column b: type = %s, want unknown", field.Type)
+		}
+	}
+}
+
+func TestMongoRawBatchBuilder_LegacyBSONTypesMatchDecodedPath(t *testing.T) {
+	oid := primitive.NewObjectID()
+	scope := bsoncore.NewDocumentBuilder().AppendInt32("x", 1).Build()
+	rawDoc := bsoncore.NewDocumentBuilder().
+		AppendJavaScript("javascript", "function () { return 1; }").
+		AppendSymbol("symbol", "legacy_symbol").
+		AppendUndefined("undefined").
+		AppendDBPointer("db_pointer", "legacy.collection", oid).
+		AppendCodeWithScope("code_with_scope", "function () { return x; }", scope).
+		AppendMinKey("min_key").
+		AppendMaxKey("max_key").
+		Build()
+
+	var decoded bson.M
+	if err := bson.Unmarshal(rawDoc, &decoded); err != nil {
+		t.Fatalf("bson.Unmarshal error = %v", err)
+	}
+
+	decodedBuilder := newMongoBatchBuilder(nil)
+	if err := decodedBuilder.AppendDocument(decoded); err != nil {
+		t.Fatalf("decoded AppendDocument error = %v", err)
+	}
+	decodedRecord, err := decodedBuilder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("decoded NewRecordBatch error = %v", err)
+	}
+	defer decodedRecord.Release()
+
+	rawBuilder := newMongoRawBatchBuilder(nil)
+	if err := rawBuilder.AppendRawDocument(bson.Raw(rawDoc)); err != nil {
+		t.Fatalf("raw AppendRawDocument error = %v", err)
+	}
+	rawRecord, err := rawBuilder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("raw NewRecordBatch error = %v", err)
+	}
+	defer rawRecord.Release()
+
+	if got, want := rawRecord.NumCols(), decodedRecord.NumCols(); got != want {
+		t.Fatalf("raw NumCols = %d, want decoded %d", got, want)
+	}
+
+	for i := 0; i < int(decodedRecord.NumCols()); i++ {
+		decodedField := decodedRecord.Schema().Field(i)
+		rawField := rawRecord.Schema().Field(i)
+		if rawField.Name != decodedField.Name {
+			t.Fatalf("field %d name = %q, want %q", i, rawField.Name, decodedField.Name)
+		}
+		if rawField.Type.String() != decodedField.Type.String() {
+			t.Fatalf("%s raw type = %s, want decoded %s", rawField.Name, rawField.Type, decodedField.Type)
+		}
+		if !isUnknownType(rawField.Type) {
+			t.Fatalf("%s raw type = %s, want unknown", rawField.Name, rawField.Type)
+		}
+		if rawRecord.Column(i).IsNull(0) {
+			t.Fatalf("%s raw value was encoded as null", rawField.Name)
+		}
+		if got, want := arrowutil.Value(rawRecord.Column(i), 0), arrowutil.Value(decodedRecord.Column(i), 0); got != want {
+			t.Fatalf("%s raw value = %#v, want decoded value %#v", rawField.Name, got, want)
+		}
+	}
+}
+
+func TestMongoRawBatchBuilder_RawStringAndObjectIDMatchDecodedPath(t *testing.T) {
+	oid := primitive.NewObjectID()
+	rawDoc := bsoncore.NewDocumentBuilder().
+		AppendString("plain", "hello").
+		AppendString("nul", "a\x00b").
+		AppendObjectID("oid", oid).
+		Build()
+
+	var decoded bson.M
+	if err := bson.Unmarshal(rawDoc, &decoded); err != nil {
+		t.Fatalf("bson.Unmarshal error = %v", err)
+	}
+
+	decodedBuilder := newMongoBatchBuilder(nil)
+	if err := decodedBuilder.AppendDocument(decoded); err != nil {
+		t.Fatalf("decoded AppendDocument error = %v", err)
+	}
+	decodedRecord, err := decodedBuilder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("decoded NewRecordBatch error = %v", err)
+	}
+	defer decodedRecord.Release()
+
+	rawBuilder := newMongoRawBatchBuilder(nil)
+	if err := rawBuilder.AppendRawDocument(bson.Raw(rawDoc)); err != nil {
+		t.Fatalf("raw AppendRawDocument error = %v", err)
+	}
+	rawRecord, err := rawBuilder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("raw NewRecordBatch error = %v", err)
+	}
+	defer rawRecord.Release()
+
+	if got, want := rawRecord.NumCols(), decodedRecord.NumCols(); got != want {
+		t.Fatalf("raw NumCols = %d, want decoded %d", got, want)
+	}
+	for i := 0; i < int(decodedRecord.NumCols()); i++ {
+		decodedField := decodedRecord.Schema().Field(i)
+		rawField := rawRecord.Schema().Field(i)
+		if rawField.Name != decodedField.Name {
+			t.Fatalf("field %d name = %q, want %q", i, rawField.Name, decodedField.Name)
+		}
+		if rawField.Type.String() != decodedField.Type.String() {
+			t.Fatalf("%s raw type = %s, want decoded %s", rawField.Name, rawField.Type, decodedField.Type)
+		}
+		if got, want := arrowutil.Value(rawRecord.Column(i), 0), arrowutil.Value(decodedRecord.Column(i), 0); got != want {
+			t.Fatalf("%s raw value = %#v, want decoded value %#v", rawField.Name, got, want)
+		}
+	}
+}
+
+func TestRawRegexPatternBytes(t *testing.T) {
+	rawDoc := bsoncore.NewDocumentBuilder().
+		AppendRegex("value", `^name[0-9]+$`, "im").
+		Build()
+
+	pattern, ok := rawRegexPatternBytes(bson.Raw(rawDoc).Lookup("value"))
+	if !ok {
+		t.Fatal("rawRegexPatternBytes returned false")
+	}
+	if got, want := string(pattern), `^name[0-9]+$`; got != want {
+		t.Fatalf("pattern = %q, want %q", got, want)
+	}
+
+	for _, malformed := range [][]byte{
+		[]byte("missing terminators"),
+		[]byte("pattern\x00options"),
+	} {
+		if _, ok := rawRegexPatternBytes(bson.RawValue{Type: bson.TypeRegex, Value: malformed}); ok {
+			t.Fatalf("rawRegexPatternBytes(%q) returned true", malformed)
+		}
+	}
+}
+
+func TestMongoRawBatchBuilder_DuplicateKeysMatchDecodedPath(t *testing.T) {
+	duplicateRaw := bsoncore.NewDocumentBuilder().
+		AppendInt32("x", 1).
+		AppendInt32("x", 2).
+		Build()
+	secondRaw := bsoncore.NewDocumentBuilder().
+		AppendInt32("x", 3).
+		Build()
+
+	var decodedDuplicate bson.M
+	if err := bson.Unmarshal(duplicateRaw, &decodedDuplicate); err != nil {
+		t.Fatalf("bson.Unmarshal duplicate error = %v", err)
+	}
+	var decodedSecond bson.M
+	if err := bson.Unmarshal(secondRaw, &decodedSecond); err != nil {
+		t.Fatalf("bson.Unmarshal second error = %v", err)
+	}
+
+	decodedBuilder := newMongoBatchBuilder(nil)
+	for _, doc := range []bson.M{decodedDuplicate, decodedSecond} {
+		if err := decodedBuilder.AppendDocument(doc); err != nil {
+			t.Fatalf("decoded AppendDocument error = %v", err)
+		}
+	}
+	decodedRecord, err := decodedBuilder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("decoded NewRecordBatch error = %v", err)
+	}
+	defer decodedRecord.Release()
+
+	rawBuilder := newMongoRawBatchBuilder(nil)
+	for _, doc := range []bson.Raw{bson.Raw(duplicateRaw), bson.Raw(secondRaw)} {
+		if err := rawBuilder.AppendRawDocument(doc); err != nil {
+			t.Fatalf("raw AppendRawDocument error = %v", err)
+		}
+	}
+	rawRecord, err := rawBuilder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("raw NewRecordBatch error = %v", err)
+	}
+	defer rawRecord.Release()
+
+	if got, want := rawRecord.NumRows(), decodedRecord.NumRows(); got != want {
+		t.Fatalf("raw NumRows = %d, want decoded %d", got, want)
+	}
+	if got, want := rawRecord.Column(0).Len(), int(rawRecord.NumRows()); got != want {
+		t.Fatalf("raw column length = %d, want %d", got, want)
+	}
+	for row := 0; row < int(decodedRecord.NumRows()); row++ {
+		if got, want := arrowutil.Value(rawRecord.Column(0), row), arrowutil.Value(decodedRecord.Column(0), row); got != want {
+			t.Fatalf("row %d raw value = %#v, want decoded value %#v", row, got, want)
+		}
+	}
+}
+
+func TestMongoRawBatchBuilder_FieldOrderFallbacks(t *testing.T) {
+	documents := []bson.Raw{
+		bson.Raw(bsoncore.NewDocumentBuilder().
+			AppendInt32("a", 1).
+			AppendString("b", "one").
+			AppendBoolean("c", true).
+			Build()),
+		bson.Raw(bsoncore.NewDocumentBuilder().
+			AppendBoolean("c", false).
+			AppendInt32("a", 2).
+			Build()),
+		bson.Raw(bsoncore.NewDocumentBuilder().
+			AppendString("d", "new").
+			AppendString("b", "three").
+			AppendInt32("a", 3).
+			Build()),
+	}
+
+	builder := newMongoRawBatchBuilder(nil)
+	for _, document := range documents {
+		if err := builder.AppendRawDocument(document); err != nil {
+			t.Fatalf("AppendRawDocument error = %v", err)
+		}
+	}
+	record, err := builder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("NewRecordBatch error = %v", err)
+	}
+	defer record.Release()
+
+	want := map[string][]any{
+		"a": {int64(1), int64(2), int64(3)},
+		"b": {"one", nil, "three"},
+		"c": {true, false, nil},
+		"d": {nil, nil, "new"},
+	}
+	if got := int(record.NumCols()); got != len(want) {
+		t.Fatalf("NumCols = %d, want %d", got, len(want))
+	}
+	for columnIndex := 0; columnIndex < int(record.NumCols()); columnIndex++ {
+		name := record.Schema().Field(columnIndex).Name
+		for row, expected := range want[name] {
+			if got := arrowutil.Value(record.Column(columnIndex), row); got != expected {
+				t.Fatalf("%s row %d = %#v, want %#v", name, row, got, expected)
+			}
+		}
+	}
+}
+
+func TestMongoRawBatchBuilder_NestedTemporalValuesMatchDecodedPath(t *testing.T) {
+	nested := bsoncore.NewDocumentBuilder().
+		AppendDateTime("dt", 1_782_003_600_123).
+		AppendTimestamp("ts", 1_782_003_600, 42).
+		Build()
+	rawDoc := bsoncore.NewDocumentBuilder().
+		AppendDocument("nested", nested).
+		Build()
+
+	var decoded bson.M
+	if err := bson.Unmarshal(rawDoc, &decoded); err != nil {
+		t.Fatalf("bson.Unmarshal error = %v", err)
+	}
+
+	decodedBuilder := newMongoBatchBuilder(nil)
+	if err := decodedBuilder.AppendDocument(decoded); err != nil {
+		t.Fatalf("decoded AppendDocument error = %v", err)
+	}
+	decodedRecord, err := decodedBuilder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("decoded NewRecordBatch error = %v", err)
+	}
+	defer decodedRecord.Release()
+
+	rawBuilder := newMongoRawBatchBuilder(nil)
+	if err := rawBuilder.AppendRawDocument(bson.Raw(rawDoc)); err != nil {
+		t.Fatalf("raw AppendRawDocument error = %v", err)
+	}
+	rawRecord, err := rawBuilder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("raw NewRecordBatch error = %v", err)
+	}
+	defer rawRecord.Release()
+
+	if got, want := rawRecord.Schema().Field(0).Type.String(), decodedRecord.Schema().Field(0).Type.String(); got != want {
+		t.Fatalf("raw nested type = %s, want decoded %s", got, want)
+	}
+	if got, want := arrowutil.Value(rawRecord.Column(0), 0), arrowutil.Value(decodedRecord.Column(0), 0); got != want {
+		t.Fatalf("raw nested value = %#v, want decoded value %#v", got, want)
+	}
+}
+
+func TestAppendJSONTimeMatchesEncodingJSON(t *testing.T) {
+	tests := []time.Time{
+		time.UnixMilli(1_782_003_600_123),
+		time.Date(2026, 6, 21, 2, 0, 0, 123_000_000, time.UTC),
+		time.Date(2026, 6, 21, 2, 0, 0, 0, time.FixedZone("", -23*3600-59*60)),
+	}
+
+	for _, tt := range tests {
+		var got bytes.Buffer
+		if !appendJSONTime(&got, tt) {
+			t.Fatalf("appendJSONTime(%v) returned false", tt)
+		}
+
+		want, err := json.Marshal(tt)
+		if err != nil {
+			t.Fatalf("json.Marshal(%v) error = %v", tt, err)
+		}
+		if got.String() != string(want) {
+			t.Fatalf("appendJSONTime(%v) = %q, want %q", tt, got.String(), want)
+		}
+	}
+}
+
+func TestAppendJSONTimeInvalidRFC3339FallsBack(t *testing.T) {
+	tests := []time.Time{
+		time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 6, 21, 2, 0, 0, 0, time.FixedZone("", 24*3600)),
+	}
+
+	for _, tt := range tests {
+		var got bytes.Buffer
+		got.WriteString("prefix")
+		if appendJSONTime(&got, tt) {
+			t.Fatalf("appendJSONTime(%v) returned true", tt)
+		}
+		if got.String() != "prefix" {
+			t.Fatalf("appendJSONTime(%v) changed buffer to %q", tt, got.String())
+		}
+	}
+}
+
+func TestMongoRawBatchBuilder_NestedBenchmarkValuesMatchDecodedPath(t *testing.T) {
+	updatedAt := int64(1_782_003_600_123)
+	profile := bsoncore.NewDocumentBuilder().
+		AppendDouble("score", 123.25).
+		AppendDouble("whole_float", 1_000_000).
+		AppendDouble("small_float", 0.000001).
+		AppendDouble("large_float", 100_000_000_000_000_000_000).
+		AppendBoolean("active", true).
+		AppendDateTime("updated_at", updatedAt).
+		Build()
+	labels := bsoncore.NewArrayBuilder().
+		AppendString("tag_1").
+		AppendString("bucket_10").
+		AppendString("escape <>& \u2028").
+		AppendString("nul\x00byte").
+		Build()
+	nested := bsoncore.NewDocumentBuilder().
+		AppendDocument("profile", profile).
+		AppendArray("labels", labels).
+		Build()
+	rank := bsoncore.NewDocumentBuilder().
+		AppendInt32("rank", 42).
+		Build()
+	arrayValue := bsoncore.NewArrayBuilder().
+		AppendInt32(7).
+		AppendString("item_7").
+		AppendDocument(rank).
+		Build()
+	rawDoc := bsoncore.NewDocumentBuilder().
+		AppendDocument("nested_doc", nested).
+		AppendArray("array_val", arrayValue).
+		Build()
+
+	var decoded bson.M
+	if err := bson.Unmarshal(rawDoc, &decoded); err != nil {
+		t.Fatalf("bson.Unmarshal error = %v", err)
+	}
+
+	decodedBuilder := newMongoBatchBuilder(nil)
+	if err := decodedBuilder.AppendDocument(decoded); err != nil {
+		t.Fatalf("decoded AppendDocument error = %v", err)
+	}
+	decodedRecord, err := decodedBuilder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("decoded NewRecordBatch error = %v", err)
+	}
+	defer decodedRecord.Release()
+
+	rawBuilder := newMongoRawBatchBuilder(nil)
+	if err := rawBuilder.AppendRawDocument(bson.Raw(rawDoc)); err != nil {
+		t.Fatalf("raw AppendRawDocument error = %v", err)
+	}
+	rawRecord, err := rawBuilder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("raw NewRecordBatch error = %v", err)
+	}
+	defer rawRecord.Release()
+
+	if got, want := rawRecord.NumCols(), decodedRecord.NumCols(); got != want {
+		t.Fatalf("raw NumCols = %d, want decoded %d", got, want)
+	}
+	for i := 0; i < int(decodedRecord.NumCols()); i++ {
+		decodedField := decodedRecord.Schema().Field(i)
+		rawField := rawRecord.Schema().Field(i)
+		if rawField.Name != decodedField.Name {
+			t.Fatalf("field %d name = %q, want %q", i, rawField.Name, decodedField.Name)
+		}
+		if rawField.Type.String() != decodedField.Type.String() {
+			t.Fatalf("%s raw type = %s, want decoded %s", rawField.Name, rawField.Type, decodedField.Type)
+		}
+		if got, want := arrowutil.Value(rawRecord.Column(i), 0), arrowutil.Value(decodedRecord.Column(i), 0); got != want {
+			t.Fatalf("%s raw value = %#v, want decoded value %#v", rawField.Name, got, want)
+		}
+	}
+}
+
+func TestMongoSchemaBatchBuilder_UsesProvidedSchema(t *testing.T) {
+	oid, _ := primitive.ObjectIDFromHex("507f1f77bcf86cd799439011")
+	created := primitive.NewDateTimeFromTime(time.Date(2026, 4, 15, 10, 0, 0, 0, time.UTC))
+
+	builder := newMongoSchemaBatchBuilder([]schema.Column{
+		{Name: "_id", DataType: schema.TypeString, Nullable: false},
+		{Name: "count", DataType: schema.TypeInt64, Nullable: true},
+		{Name: "created_at", DataType: schema.TypeTimestampTZ, Nullable: true},
+	}, nil)
+
+	if err := builder.AppendDocument(bson.M{
+		"_id":        oid,
+		"count":      "42",
+		"created_at": created,
+		"extra":      "ignored",
+	}); err != nil {
+		t.Fatalf("AppendDocument error = %v", err)
+	}
+
+	record, err := builder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("NewRecordBatch error = %v", err)
+	}
+	defer record.Release()
+
+	if got := record.NumCols(); got != 3 {
+		t.Fatalf("NumCols = %d, want 3", got)
+	}
+	wantNames := []string{"_id", "count", "created_at"}
+	for i, want := range wantNames {
+		if got := record.Schema().Field(i).Name; got != want {
+			t.Fatalf("field %d = %q, want %q", i, got, want)
+		}
+	}
+	if got := arrowutil.Value(record.Column(0), 0); got != oid.Hex() {
+		t.Fatalf("_id = %#v, want %q", got, oid.Hex())
+	}
+	if got := arrowutil.Value(record.Column(1), 0); got != int64(42) {
+		t.Fatalf("count = %#v, want %v", got, int64(42))
+	}
+	if got := record.Schema().Field(2).Type.String(); got != "timestamp[us, tz=UTC]" {
+		t.Fatalf("created_at type = %s, want timestamp[us, tz=UTC]", got)
+	}
+}
+
+func TestMongoSchemaBatchBuilder_FieldOrderFallbacks(t *testing.T) {
+	builder := newMongoSchemaBatchBuilder([]schema.Column{
+		{Name: "a", DataType: schema.TypeInt64},
+		{Name: "b", DataType: schema.TypeString},
+		{Name: "c", DataType: schema.TypeBoolean},
+	}, nil)
+	documents := []bson.Raw{
+		bson.Raw(bsoncore.NewDocumentBuilder().
+			AppendInt32("a", 1).
+			AppendString("b", "one").
+			AppendBoolean("c", true).
+			Build()),
+		bson.Raw(bsoncore.NewDocumentBuilder().
+			AppendString("extra", "ignored").
+			AppendBoolean("c", false).
+			AppendInt32("a", 2).
+			Build()),
+		bson.Raw(bsoncore.NewDocumentBuilder().
+			AppendString("b", "three").
+			AppendInt32("a", 3).
+			Build()),
+	}
+	for _, document := range documents {
+		if err := builder.AppendRawDocument(document); err != nil {
+			t.Fatalf("AppendRawDocument error = %v", err)
+		}
+	}
+
+	record, err := builder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("NewRecordBatch error = %v", err)
+	}
+	defer record.Release()
+
+	want := [][]any{
+		{int64(1), int64(2), int64(3)},
+		{"one", nil, "three"},
+		{true, false, nil},
+	}
+	for columnIndex, values := range want {
+		for row, expected := range values {
+			if got := arrowutil.Value(record.Column(columnIndex), row); got != expected {
+				t.Fatalf("column %d row %d = %#v, want %#v", columnIndex, row, got, expected)
+			}
+		}
+	}
+}
+
+func BenchmarkMongoRawBatchBuilder(b *testing.B) {
+	benchmarkMongoRawBatchBuilder(b, 25_000)
+}
+
+func BenchmarkMongoRawBatchBuilderNoReserve(b *testing.B) {
+	benchmarkMongoRawBatchBuilder(b, 0)
+}
+
+func BenchmarkMongoRawBatchBuilderRecyclingAllocator(b *testing.B) {
+	for _, cacheSize := range []int{8 << 20, 16 << 20, 32 << 20, 64 << 20} {
+		b.Run(fmt.Sprintf("Cache%dMiB", cacheSize>>20), func(b *testing.B) {
+			benchmarkMongoRawBatchBuilderWithAllocator(
+				b,
+				25_000,
+				newRecyclingAllocator(memory.NewGoAllocator(), cacheSize),
+			)
+		})
+	}
+}
+
+func benchmarkMongoRawBatchBuilder(b *testing.B, rowCapacity int) {
+	benchmarkMongoRawBatchBuilderWithAllocator(b, rowCapacity, memory.NewGoAllocator())
+}
+
+func benchmarkMongoRawBatchBuilderWithAllocator(b *testing.B, rowCapacity int, mem memory.Allocator) {
+	raw := benchmarkMongoRawDocument(b)
+	b.SetBytes(int64(len(raw)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	builder := newMongoRawBatchBuilderWithAllocator(mem, nil, rowCapacity)
+	for i := 0; i < b.N; i++ {
+		if err := builder.AppendRawDocument(raw); err != nil {
+			b.Fatal(err)
+		}
+		if (i+1)%25_000 == 0 {
+			record, err := builder.NewRecordBatch()
+			if err != nil {
+				b.Fatal(err)
+			}
+			record.Release()
+		}
+	}
+
+	b.StopTimer()
+	if builder.rowCount > 0 {
+		record, err := builder.NewRecordBatch()
+		if err != nil {
+			b.Fatal(err)
+		}
+		record.Release()
+	}
+}
+
+func BenchmarkRawBSONValueAsJSONString(b *testing.B) {
+	raw := benchmarkMongoRawDocument(b)
+	value := raw.Lookup("nested_doc")
+	b.SetBytes(int64(len(value.Value)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		encoded, ok := rawBSONValueAsJSONString(value)
+		if !ok {
+			b.Fatal("failed to encode nested BSON")
+		}
+		benchmarkJSONString = encoded
+	}
+}
+
+func BenchmarkMongoSchemaRawBatchBuilder(b *testing.B) {
+	benchmarkMongoSchemaRawBatchBuilder(b, 25_000)
+}
+
+func BenchmarkMongoSchemaRawBatchBuilderNoReserve(b *testing.B) {
+	benchmarkMongoSchemaRawBatchBuilder(b, 0)
+}
+
+func BenchmarkMongoSchemaRawBatchBuilderRecyclingAllocator(b *testing.B) {
+	benchmarkMongoSchemaRawBatchBuilderWithAllocator(
+		b,
+		25_000,
+		newRecyclingAllocator(memory.NewGoAllocator(), mongoArrowBufferCacheSize),
+	)
+}
+
+func benchmarkMongoSchemaRawBatchBuilder(b *testing.B, rowCapacity int) {
+	benchmarkMongoSchemaRawBatchBuilderWithAllocator(b, rowCapacity, memory.NewGoAllocator())
+}
+
+func benchmarkMongoSchemaRawBatchBuilderWithAllocator(b *testing.B, rowCapacity int, mem memory.Allocator) {
+	raw := benchmarkMongoRawDocument(b)
+	columns := benchmarkMongoSchema()
+	b.SetBytes(int64(len(raw)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	builder := newMongoSchemaBatchBuilderWithAllocator(mem, columns, nil, rowCapacity)
+	for i := 0; i < b.N; i++ {
+		if err := builder.AppendRawDocument(raw); err != nil {
+			b.Fatal(err)
+		}
+		if (i+1)%25_000 == 0 {
+			record, err := builder.NewRecordBatch()
+			if err != nil {
+				b.Fatal(err)
+			}
+			record.Release()
+			builder = newMongoSchemaBatchBuilderWithAllocator(mem, columns, nil, rowCapacity)
+		}
+	}
+
+	b.StopTimer()
+	if builder.rowCount > 0 {
+		record, err := builder.NewRecordBatch()
+		if err != nil {
+			b.Fatal(err)
+		}
+		record.Release()
+	} else {
+		builder.Release()
+	}
+}
+
+func benchmarkMongoRawDocument(tb testing.TB) bson.Raw {
+	tb.Helper()
+
+	doc := bson.D{
+		{Key: "_id", Value: primitive.NewObjectID()},
+		{Key: "id", Value: int32(42)},
+		{Key: "small_str", Value: "name_42"},
+		{Key: "medium_str", Value: "user_42@example-42.com"},
+		{Key: "large_str", Value: strings.Repeat("Q", 142)},
+		{Key: "tiny_int", Value: int32(42)},
+		{Key: "regular_int", Value: int32(42)},
+		{Key: "big_int", Value: int64(42_000_000)},
+		{Key: "float_val", Value: 48.0},
+		{Key: "decimal_val", Value: mustDecimal128(tb, "420.0000")},
+		{Key: "bool_val", Value: true},
+		{Key: "date_val", Value: primitive.NewDateTimeFromTime(time.Unix(1_700_000_000, 0).UTC())},
+		{Key: "ts_val", Value: primitive.NewDateTimeFromTime(time.Unix(1_700_000_042, 0).UTC())},
+		{Key: "ts_tz_val", Value: primitive.NewDateTimeFromTime(time.Unix(1_700_010_042, 0).UTC())},
+		{Key: "extra_text", Value: "extra_text_row_42_" + strings.Repeat("x", 92)},
+		{Key: "object_id_val", Value: primitive.NewObjectID()},
+		{Key: "decimal_value", Value: mustDecimal128(tb, "42.0042")},
+		{Key: "nested_doc", Value: bson.D{
+			{Key: "profile", Value: bson.D{
+				{Key: "score", Value: 42.0 / 13.0},
+				{Key: "active", Value: true},
+				{Key: "updated_at", Value: primitive.NewDateTimeFromTime(time.Unix(1_700_000_000, 0).UTC())},
+			}},
+			{Key: "labels", Value: bson.A{"tag_2", "bucket_42"}},
+		}},
+		{Key: "array_val", Value: bson.A{int32(42), "item_42", bson.D{{Key: "rank", Value: int32(42)}}}},
+		{Key: "binary_val", Value: primitive.Binary{Data: []byte{1, 2, 3, 4, 5, 6, 7, 8}}},
+		{Key: "regex_val", Value: primitive.Regex{Pattern: "^name_42", Options: "i"}},
+		{Key: "timestamp_val", Value: primitive.Timestamp{T: 1_700_000_042, I: 42}},
+		{Key: "null_val", Value: nil},
+		{Key: "optional_val", Value: "present_42"},
+	}
+
+	raw, err := bson.Marshal(doc)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return bson.Raw(raw)
+}
+
+func benchmarkMongoSchema() []schema.Column {
+	return []schema.Column{
+		{Name: "_id", DataType: schema.TypeString},
+		{Name: "id", DataType: schema.TypeInt64},
+		{Name: "small_str", DataType: schema.TypeString},
+		{Name: "medium_str", DataType: schema.TypeString},
+		{Name: "large_str", DataType: schema.TypeString},
+		{Name: "tiny_int", DataType: schema.TypeInt64},
+		{Name: "regular_int", DataType: schema.TypeInt64},
+		{Name: "big_int", DataType: schema.TypeInt64},
+		{Name: "float_val", DataType: schema.TypeFloat64},
+		{Name: "decimal_val", DataType: schema.TypeString},
+		{Name: "bool_val", DataType: schema.TypeBoolean},
+		{Name: "date_val", DataType: schema.TypeTimestamp},
+		{Name: "ts_val", DataType: schema.TypeTimestamp},
+		{Name: "ts_tz_val", DataType: schema.TypeTimestamp},
+		{Name: "extra_text", DataType: schema.TypeString},
+		{Name: "object_id_val", DataType: schema.TypeString},
+		{Name: "decimal_value", DataType: schema.TypeString},
+		{Name: "nested_doc", DataType: schema.TypeJSON},
+		{Name: "array_val", DataType: schema.TypeJSON},
+		{Name: "binary_val", DataType: schema.TypeBinary},
+		{Name: "regex_val", DataType: schema.TypeString},
+		{Name: "timestamp_val", DataType: schema.TypeTimestamp},
+		{Name: "null_val", DataType: schema.TypeString},
+		{Name: "optional_val", DataType: schema.TypeString},
+	}
+}
+
+func mustDecimal128(tb testing.TB, value string) primitive.Decimal128 {
+	tb.Helper()
+	v, err := primitive.ParseDecimal128(value)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return v
+}
+
+func TestMongoSchemaBatchBuilder_ExcludesSchemaColumns(t *testing.T) {
+	builder := newMongoSchemaBatchBuilder([]schema.Column{
+		{Name: "keep", DataType: schema.TypeString},
+		{Name: "skip", DataType: schema.TypeString},
+	}, []string{"skip"})
+
+	if err := builder.AppendDocument(bson.M{"keep": "one", "skip": "two"}); err != nil {
+		t.Fatalf("AppendDocument error = %v", err)
+	}
+
+	record, err := builder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("NewRecordBatch error = %v", err)
+	}
+	defer record.Release()
+
+	if got := record.NumCols(); got != 1 {
+		t.Fatalf("NumCols = %d, want 1", got)
+	}
+	if got := record.Schema().Field(0).Name; got != "keep" {
+		t.Fatalf("field 0 = %q, want keep", got)
+	}
+}
+
+func TestMongoBatchBuilder_NumericPromotionWithinBatch(t *testing.T) {
+	// First value is float64 → Float64Builder. A subsequent int64 must be
+	// upcast into the same Float64 column without promoting to unknown.
+	builder := newMongoBatchBuilder(nil)
+	if err := builder.AppendDocument(bson.M{"v": 3.14}); err != nil {
+		t.Fatalf("doc 1 error = %v", err)
+	}
+	if err := builder.AppendDocument(bson.M{"v": int64(7)}); err != nil {
+		t.Fatalf("doc 2 error = %v", err)
+	}
+
+	record, err := builder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("NewRecordBatch error = %v", err)
+	}
+	defer record.Release()
+
+	if got := record.Schema().Field(0).Type.String(); got != "float64" {
+		t.Fatalf("type = %s, want float64", got)
+	}
+	if got := arrowutil.Value(record.Column(0), 0); got != 3.14 {
+		t.Errorf("row 0 = %#v, want 3.14", got)
+	}
+	if got := arrowutil.Value(record.Column(0), 1); got != 7.0 {
+		t.Errorf("row 1 = %#v, want 7.0", got)
+	}
+}
+
+func TestMongoBatchBuilder_NestedDocAndArrayUseJSONType(t *testing.T) {
+	builder := newMongoBatchBuilder(nil)
+	doc := bson.M{
+		"meta":   bson.M{"src": "test", "level": int64(1)},
+		"tags":   primitive.A{"a", "b", "c"},
+		"scalar": "ok",
+	}
+	if err := builder.AppendDocument(doc); err != nil {
+		t.Fatalf("AppendDocument error = %v", err)
+	}
+
+	record, err := builder.NewRecordBatch()
+	if err != nil {
+		t.Fatalf("NewRecordBatch error = %v", err)
+	}
+	defer record.Release()
+
+	for i := 0; i < int(record.NumCols()); i++ {
+		field := record.Schema().Field(i)
+		switch field.Name {
+		case "meta", "tags":
+			if !arrow.TypeEqual(field.Type, schema.JSONArrowType) {
+				t.Errorf("%s: type = %s, want JSON", field.Name, field.Type)
+			}
+		case "scalar":
+			if field.Type.String() != "utf8" {
+				t.Errorf("scalar: type = %s, want utf8", field.Type)
+			}
+		}
+	}
+}
+
+func TestConvertMongoShellToExtendedJSON(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "ObjectId",
+			input: `[{"$match": {"_id": ObjectId("507f1f77bcf86cd799439011")}}]`,
+			want:  `[{"$match": {"_id": {"$oid": "507f1f77bcf86cd799439011"}}}]`,
+		},
+		{
+			name:  "ISODate",
+			input: `[{"$match": {"created_at": {"$gte": ISODate("2025-01-01T00:00:00Z")}}}]`,
+			want:  `[{"$match": {"created_at": {"$gte": {"$date": "2025-01-01T00:00:00Z"}}}}]`,
+		},
+		{
+			name:  "NumberLong with quotes",
+			input: `[{"$match": {"count": NumberLong("12345678901234")}}]`,
+			want:  `[{"$match": {"count": {"$numberLong": "12345678901234"}}}]`,
+		},
+		{
+			name:  "NumberLong without quotes",
+			input: `[{"$match": {"count": NumberLong(42)}}]`,
+			want:  `[{"$match": {"count": {"$numberLong": "42"}}}]`,
+		},
+		{
+			name:  "NumberInt",
+			input: `[{"$match": {"age": NumberInt(25)}}]`,
+			want:  `[{"$match": {"age": {"$numberInt": "25"}}}]`,
+		},
+		{
+			name:  "NumberDecimal",
+			input: `[{"$match": {"price": NumberDecimal("19.99")}}]`,
+			want:  `[{"$match": {"price": {"$numberDecimal": "19.99"}}}]`,
+		},
+		{
+			name:  "Timestamp",
+			input: `[{"$match": {"ts": Timestamp(1234, 1)}}]`,
+			want:  `[{"$match": {"ts": {"$timestamp": {"t": 1234, "i": 1}}}}]`,
+		},
+		{
+			name:  "MinKey and MaxKey",
+			input: `[{"$match": {"$gte": MinKey(), "$lte": MaxKey()}}]`,
+			want:  `[{"$match": {"$gte": {"$minKey": 1}, "$lte": {"$maxKey": 1}}}]`,
+		},
+		{
+			name:  "UUID",
+			input: `[{"$match": {"uid": UUID("550e8400-e29b-41d4-a716-446655440000")}}]`,
+			want:  `[{"$match": {"uid": {"$uuid": "550e8400-e29b-41d4-a716-446655440000"}}}]`,
+		},
+		{
+			name:  "plain JSON unchanged",
+			input: `[{"$match": {"status": "active"}}]`,
+			want:  `[{"$match": {"status": "active"}}]`,
+		},
+		{
+			name:  "multiple constructors in one pipeline",
+			input: `[{"$match": {"_id": ObjectId("abc"), "date": ISODate("2025-01-01")}}]`,
+			want:  `[{"$match": {"_id": {"$oid": "abc"}, "date": {"$date": "2025-01-01"}}}]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := convertMongoShellToExtendedJSON(tt.input)
+			if got != tt.want {
+				t.Errorf("\ngot:  %s\nwant: %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConsumeCursorByteCap(t *testing.T) {
+	wide := strings.Repeat("x", 2048)
+	const rows = 40
+	docs := make([]interface{}, rows)
+	for i := range docs {
+		docs[i] = bson.D{{Key: "_id", Value: i}, {Key: "name", Value: wide}}
+	}
+
+	run := func(max int64) (batches, total int) {
+		cursor, err := mongo.NewCursorFromDocuments(docs, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		results := make(chan source.RecordBatchResult)
+		s := &MongoDBSource{}
+		go func() {
+			defer close(results)
+			s.consumeCursor(context.Background(), cursor, 100_000, source.ReadOptions{MaxBatchBytes: max}, results, time.Now())
+		}()
+		for res := range results {
+			if res.Err != nil {
+				t.Fatalf("batch error: %v", res.Err)
+			}
+			batches++
+			total += int(res.Batch.NumRows())
+			res.Batch.Release()
+		}
+		return batches, total
+	}
+
+	offB, offR := run(0)
+	if offB != 1 {
+		t.Fatalf("cap-off batches=%d, want 1", offB)
+	}
+	onB, onR := run(4096)
+	if onB <= 1 {
+		t.Fatalf("cap-on batches=%d, want >1", onB)
+	}
+	if offR != onR || offR != rows {
+		t.Fatalf("row mismatch: off=%d on=%d want=%d", offR, onR, rows)
+	}
+}
