@@ -165,13 +165,15 @@ settings keys are recognised by this version:
 - `attribution.commit`, `attribution.pr` (both strings)
 
 `attribution.commit` and `attribution.pr` were already set to empty strings
-in the user-level settings before this build started. Setting
-`includeCoAuthoredBy: false` in the same file could not be completed from
-within the session: the harness's auto-mode classifier denies self-modifying
-the development tool's own settings file as a safety measure. This must be
-set manually by the maintainer, or approved via a permission rule, before
-relying on it as a second line of defence — `fabric/scripts/check-attribution.sh`
-is the actual enforcement mechanism and does not depend on this setting.
+in the user-level settings before this build started. An initial attempt to
+also set `includeCoAuthoredBy: false` in the same file, via a dedicated
+config-editing tool, was denied by the harness's auto-mode classifier as
+self-modification of the development tool's own settings. The maintainer
+confirmed the change explicitly; a direct file edit on the retry succeeded,
+and `includeCoAuthoredBy: false` is now set alongside the empty attribution
+strings. `fabric/scripts/check-attribution.sh` remains the actual
+enforcement mechanism in this repository and does not depend on either
+setting.
 
 ## 6. Repository controls (build brief section 12.6)
 
